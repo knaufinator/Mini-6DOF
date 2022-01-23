@@ -55,11 +55,11 @@ void process_data ( char * data)
       float temp = 0.0;
           
       if(i == 2)
-        temp =mapfloat(value, 0, 4094, -7, 7);//hieve 
+        temp =mapfloat(value, 0, 4094, -4, 4);//hieve 
       else if(i > 2)//rotations, pitch,roll,yaw
-        temp = mapfloat(value, 0, 4094, -30, 30) *(pi/180.0);
+        temp = mapfloat(value, 0, 4094, -10, 10) *(pi/180.0);
       else//sway,surge
-        temp = mapfloat(value, 0, 4094, -8, 8); 
+        temp = mapfloat(value, 0, 4094, -7, 7); 
 
         arr[i++] = temp;
       
@@ -104,10 +104,15 @@ void setPos(){
 
       
          if(i==INV1||i==INV2||i==INV3){
-            x = constrain(zero[i] + (alpha)*servoPulseMult, MIN,MAX);
+           // x = constrain(zero[i] + (alpha)*servoPulseMult, MIN,MAX);
+
+             x = strictMap(zero[i] + (alpha)*servoPulseMult, MIN, MAX ,MIN, MAX);
           }
           else{
-            x = constrain(zero[i] - (alpha)*servoPulseMult, MIN,MAX);
+            //x = constrain(zero[i] - (alpha)*servoPulseMult, MIN,MAX);
+          
+          
+              x = strictMap(zero[i] - (alpha)*servoPulseMult, MIN, MAX ,MIN, MAX);
           }
           
           servo_pos[i] = x;               
@@ -124,6 +129,12 @@ void setPos(){
     Serial.println("");
 }
 
+long strictMap(long val, long inmin, long inmax, long outmin, long outmax)
+{
+  if (val <= inmin) return outmin;
+  if (val >= inmax) return outmax;
+  return (val - inmin)*(outmax - outmin)/(inmax - inmin) + outmin;
+}
 
 //reset timer
 void ping( TimerHandle_t xTimer )
