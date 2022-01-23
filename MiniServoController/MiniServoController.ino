@@ -83,6 +83,8 @@ class MyCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pCharacteristic) {
       std::string value = pCharacteristic->getValue();
 
+       Serial.print(value.c_str());
+
       if (value.length() > 0) {
         char* c = strcpy(new char[value.length() + 1], value.c_str());
         process_data (c);          
