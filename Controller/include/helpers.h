@@ -48,7 +48,7 @@
 #define DEBUG_DISABLE_CMD "DBG:0"
 
 // Serial communication
-#define MAX_SERIAL_INPUT 60
+#define MAX_SERIAL_INPUT 256
 
 // Helper function declarations
 float mapfloat(float x, float in_min, float in_max, float out_min, float out_max);

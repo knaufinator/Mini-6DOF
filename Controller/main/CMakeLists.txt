@@ -6,6 +6,7 @@ idf_component_register(
         "helpers.cpp"
         "InverseKinematics.cpp"
         "AxisScaling.cpp"
+        "BleTransport.cpp"
     INCLUDE_DIRS 
         "."
         "../include"
@@ -14,11 +15,12 @@ idf_component_register(
         esp_timer     # For high-resolution timing
         nvs_flash     # For non-volatile storage
         freertos      # For tasks, semaphores
+        bt            # For BLE transport
 )
 
 # Enable C++11 support
 set_source_files_properties(
-    main.cpp helpers.cpp InverseKinematics.cpp AxisScaling.cpp
+    main.cpp helpers.cpp InverseKinematics.cpp AxisScaling.cpp BleTransport.cpp
     PROPERTIES COMPILE_FLAGS "-std=gnu++11"
 )
 
@@ -31,4 +33,4 @@ target_compile_options(${COMPONENT_LIB} PRIVATE
 )
 
 # Enable runtime-toggled debug output (DBG:1 / DBG:0 serial commands)
-target_compile_definitions(${COMPONENT_LIB} PRIVATE ENABLE_DEBUG_UART=1)
+target_compile_definitions(${COMPONENT_LIB} PRIVATE ENABLE_DEBUG_UART=1 ENABLE_BLE=1)

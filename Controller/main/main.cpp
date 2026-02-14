@@ -38,6 +38,7 @@
 #include "InverseKinematics.h"
 #include "AxisScaling.h"
 #include "version.h"
+#include "BleTransport.h"
 
 static const char* TAG = "mini6dof";
 
@@ -85,7 +86,28 @@ static float maxRawInput = 4095.0f;
 
 // ── Motion State ─────────────────────────────────────────────────────
 static volatile float arr[6] = {0, 0, 0, 0, 0, 0};  // current IK position (physical units)
+static volatile float lastServoAngles[6] = {0};         // latest IK output (radians) for telemetry
 static SemaphoreHandle_t xMutex = NULL;
+
+// ── Telemetry Rate ──────────────────────────────────────────────────
+static volatile int telemetryDelayMs = 20;  // default 50Hz (was 100ms = 10Hz)
+static volatile bool telemetryEnabled = false;  // silent until app sends TELRATE:N after handshake
+
+// ── Activity Watchdog ────────────────────────────────────────────────
+static volatile int64_t lastPacketTimeUs = 0;            // esp_timer_get_time() of last motion packet
+#define WATCHDOG_TIMEOUT_US  500000                      // 500ms — home if no input
+static volatile bool watchdogTripped = false;
+
+// ── Slew-Rate Limiter ────────────────────────────────────────────────
+// Limits maximum position change per servo update cycle to prevent jerks.
+// Units: physical (mm or rad) per call. At ~50Hz servo rate this is per 20ms.
+#define SLEW_RATE_MAX   5.0f                             // mm (or rad) per cycle — fast tracking, app handles S-curve ramp
+static float smoothedPosition[6] = {0};                  // current smoothed output
+static bool smoothingInitialized = false;
+
+// ── IK Angle Limits ──────────────────────────────────────────────────
+// Max servo arm deflection in radians (±45° is typical hobby servo range)
+#define SERVO_MAX_ANGLE_RAD  (IK_PI / 4.0f)
 
 // ── Servo PWM ────────────────────────────────────────────────────────
 static const int servoPins[6] = {
@@ -101,6 +123,42 @@ static float servoPulsePerRad = 800.0f / (float)(IK_PI / 4.0);
 
 // Inverted servos (mounted mirrored)
 static const bool servoInverted[6] = {true, false, true, false, true, false};
+
+// ── NVS Persistence ─────────────────────────────────────────────────
+static const char* NVS_NAMESPACE = "mini6dof";
+
+static void saveConfigToNVS() {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_blob(h, "servo_center", servoCenter, sizeof(servoCenter));
+        nvs_set_blob(h, "pulse_per_rad", &servoPulsePerRad, sizeof(servoPulsePerRad));
+        nvs_set_blob(h, "geometry", &stewartConfig, sizeof(stewartConfig));
+        nvs_set_u8(h, "bit_depth", inputBitRange);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static void loadConfigFromNVS() {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        size_t sz;
+        sz = sizeof(servoCenter);
+        nvs_get_blob(h, "servo_center", servoCenter, &sz);
+        sz = sizeof(servoPulsePerRad);
+        nvs_get_blob(h, "pulse_per_rad", &servoPulsePerRad, &sz);
+        sz = sizeof(stewartConfig);
+        if (nvs_get_blob(h, "geometry", &stewartConfig, &sz) == ESP_OK) {
+            // Geometry loaded from NVS — recompute scales after load
+        }
+        uint8_t bits = 0;
+        if (nvs_get_u8(h, "bit_depth", &bits) == ESP_OK && bits >= 8 && bits <= 16) {
+            inputBitRange = bits;
+            maxRawInput = (float)((1 << bits) - 1);
+        }
+        nvs_close(h);
+    }
+}
 
 // ── LEDC PWM Setup ──────────────────────────────────────────────────
 
@@ -148,20 +206,70 @@ static void setServoPulse(int channel, int us) {
     ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)channel);
 }
 
+// ── Slew-Rate Limited Position Update ────────────────────────────────
+// Applies per-axis slew-rate limiting to prevent servo jerk from large steps.
+// Returns the smoothed position in `out[6]`.
+
+static void slewRateLimit(const float target[6], float out[6]) {
+    if (!smoothingInitialized) {
+        memcpy(smoothedPosition, target, sizeof(smoothedPosition));
+        smoothingInitialized = true;
+    }
+    for (int i = 0; i < 6; i++) {
+        float delta = target[i] - smoothedPosition[i];
+        if (delta > SLEW_RATE_MAX) delta = SLEW_RATE_MAX;
+        else if (delta < -SLEW_RATE_MAX) delta = -SLEW_RATE_MAX;
+        smoothedPosition[i] += delta;
+        out[i] = smoothedPosition[i];
+    }
+}
+
 // ── Apply Motion Values ──────────────────────────────────────────────
+// Improvements over original:
+//   1. Slew-rate limiting prevents servo jerk from large position steps
+//   2. IK output validated (NaN / out-of-range clamped)
+//   3. Atomic servo update: all 6 duties set first, then all 6 updated
 
 static void applyMotionValues(float position[6]) {
-    float angles[6];
-    calculateAllServoAngles(position, &stewartConfig, angles);
+    // Slew-rate limit the input position
+    float limited[6];
+    slewRateLimit(position, limited);
 
+    // Run inverse kinematics
+    float angles[6];
+    calculateAllServoAngles(limited, &stewartConfig, angles);
+
+    // Validate IK output — clamp NaN and out-of-range angles
     for (int i = 0; i < 6; i++) {
-        int pulse;
-        if (servoInverted[i]) {
-            pulse = servoCenter[i] + (int)(angles[i] * servoPulsePerRad);
-        } else {
-            pulse = servoCenter[i] - (int)(angles[i] * servoPulsePerRad);
+        if (isnan(angles[i]) || isinf(angles[i])) {
+            angles[i] = 0.0f;  // safe fallback
+        } else if (angles[i] > SERVO_MAX_ANGLE_RAD) {
+            angles[i] = SERVO_MAX_ANGLE_RAD;
+        } else if (angles[i] < -SERVO_MAX_ANGLE_RAD) {
+            angles[i] = -SERVO_MAX_ANGLE_RAD;
         }
-        setServoPulse(i, pulse);
+    }
+
+    memcpy((void*)lastServoAngles, angles, sizeof(lastServoAngles));
+
+    // Pre-compute all 6 pulse widths
+    int pulse[6];
+    for (int i = 0; i < 6; i++) {
+        if (servoInverted[i]) {
+            pulse[i] = servoCenter[i] + (int)(angles[i] * servoPulsePerRad);
+        } else {
+            pulse[i] = servoCenter[i] - (int)(angles[i] * servoPulsePerRad);
+        }
+        if (pulse[i] < SERVO_MIN_US) pulse[i] = SERVO_MIN_US;
+        if (pulse[i] > SERVO_MAX_US) pulse[i] = SERVO_MAX_US;
+    }
+
+    // Atomic batch update: set all duties first, then trigger all updates
+    for (int i = 0; i < 6; i++) {
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)i, usToDuty(pulse[i]));
+    }
+    for (int i = 0; i < 6; i++) {
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)i);
     }
 }
 
@@ -188,6 +296,8 @@ void process_binary_packet(const uint8_t* payload) {
     if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
         for (int i = 0; i < 6; i++) arr[i] = position[i];
         applyMotionValues(position);
+        lastPacketTimeUs = esp_timer_get_time();
+        watchdogTripped = false;
         xSemaphoreGive(xMutex);
     }
 }
@@ -221,6 +331,7 @@ void process_data(char* data) {
             inputBitRange = (uint8_t)bits;
             maxRawInput = (float)((1 << bits) - 1);
             serial_printf("BITS:%d,max_raw=%.0f\r\n", inputBitRange, maxRawInput);
+            saveConfigToNVS();
         } else {
             serial_printf("ERR:BITS range 8-16\r\n");
         }
@@ -282,6 +393,7 @@ void process_data(char* data) {
             if (changed) {
                 computeAxisScalesFromGeometry(&axisScales, &stewartConfig, 0.90f);
                 serial_printf("CONFIG:OK %s=%.4f (scales recomputed)\r\n", param, val);
+                saveConfigToNVS();
             }
         }
         return;
@@ -301,6 +413,7 @@ void process_data(char* data) {
             serial_printf("SERVO:CENTER=%d,%d,%d,%d,%d,%d\r\n",
                 servoCenter[0], servoCenter[1], servoCenter[2],
                 servoCenter[3], servoCenter[4], servoCenter[5]);
+            saveConfigToNVS();
         } else {
             serial_printf("ERR:SERVO:CENTER needs 6 comma-separated values\r\n");
         }
@@ -313,8 +426,29 @@ void process_data(char* data) {
         if (val > 0.0f && val < 10000.0f) {
             servoPulsePerRad = val;
             serial_printf("SERVO:PULSE=%.1f\r\n", servoPulsePerRad);
+            saveConfigToNVS();
         } else {
             serial_printf("ERR:SERVO:PULSE out of range\r\n");
+        }
+        return;
+    }
+
+    // ── TELRATE? — Query telemetry rate ────────────────────────────────
+    if (strcmp(data, "TELRATE?") == 0) {
+        serial_printf("TELRATE:%d\r\n", (int)(1000 / telemetryDelayMs));
+        return;
+    }
+
+    // ── TELRATE:N — Set telemetry rate in Hz (1-100) ────────────────
+    if (strncmp(data, "TELRATE:", 8) == 0) {
+        int hz = atoi(data + 8);
+        if (hz >= 1 && hz <= 100) {
+            telemetryDelayMs = 1000 / hz;
+            if (telemetryDelayMs < 10) telemetryDelayMs = 10;  // cap at 100Hz
+            telemetryEnabled = true;  // start sending telemetry
+            serial_printf("TELRATE:%d (delay=%dms)\r\n", hz, telemetryDelayMs);
+        } else {
+            serial_printf("ERR:TELRATE range 1-100\r\n");
         }
         return;
     }
@@ -362,6 +496,8 @@ void process_data(char* data) {
         if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             for (int i = 0; i < 6; i++) arr[i] = position[i];
             applyMotionValues(position);
+            lastPacketTimeUs = esp_timer_get_time();
+            watchdogTripped = false;
             xSemaphoreGive(xMutex);
         }
     }
@@ -378,12 +514,12 @@ void processIncomingByte(const uint8_t inByte) {
     // Binary packet detection: 0xAA 0x55 header
     switch (binState) {
         case WAIT_SYNC1:
-            if (inByte == 0xAA) binState = WAIT_SYNC2;
-            break;
+            if (inByte == 0xAA) { binState = WAIT_SYNC2; return; }
+            break;  // not 0xAA — fall through to ASCII parser
         case WAIT_SYNC2:
-            if (inByte == 0x55) { binState = READ_PAYLOAD; binPos = 0; }
-            else binState = WAIT_SYNC1;
-            break;
+            if (inByte == 0x55) { binState = READ_PAYLOAD; binPos = 0; return; }
+            binState = WAIT_SYNC1;
+            break;  // not 0x55 — fall through to ASCII parser (false sync)
         case READ_PAYLOAD:
             binPayload[binPos++] = inByte;
             if (binPos >= 13) {
@@ -459,10 +595,11 @@ extern "C" void app_main(void) {
     xMutex = xSemaphoreCreateMutex();
     xPrintMutex = xSemaphoreCreateMutex();
 
-    // Initialize platform config with Mini-6DOF defaults
+    // Initialize platform config with Mini-6DOF defaults, then overlay NVS
     initMiniDefaults(&stewartConfig);
+    loadConfigFromNVS();
 
-    // Compute axis scales from geometry
+    // Compute axis scales from geometry (may have been loaded from NVS)
     computeAxisScalesFromGeometry(&axisScales, &stewartConfig, 0.90f);
 
     serial_printf("\r\n");
@@ -522,9 +659,47 @@ extern "C" void app_main(void) {
     serial_printf("Serial monitor started. Accepting commands.\r\n");
     serial_printf("Commands: VERSION? FINGERPRINT? CONFIG? SCALE? BITS? BITS:N ZERO ESTOP:SOFT\r\n");
 
-    // Main loop — currently idle (servo updates happen in response to serial data)
-    // Could add watchdog, telemetry, etc. here
+    // Initialize BLE transport
+#ifdef ENABLE_BLE
+    if (ble_transport_init(process_binary_packet)) {
+        serial_printf("BLE initialized — advertising as 'Mini6DOF'\r\n");
+    } else {
+        serial_printf("BLE init FAILED\r\n");
+    }
+#endif
+
+    // Seed watchdog timer so it doesn't trip immediately on boot
+    lastPacketTimeUs = esp_timer_get_time();
+
+    // Main loop: watchdog + telemetry at 10Hz
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(100));
+        // ── Activity watchdog: home to center if no motion data for 500ms ──
+        int64_t now = esp_timer_get_time();
+        if (lastPacketTimeUs > 0 && (now - lastPacketTimeUs) > WATCHDOG_TIMEOUT_US) {
+            if (!watchdogTripped) {
+                if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                    float home[6] = {0, 0, 0, 0, 0, 0};
+                    for (int i = 0; i < 6; i++) arr[i] = 0;
+                    applyMotionValues(home);
+                    xSemaphoreGive(xMutex);
+                }
+                watchdogTripped = true;
+                serial_printf("WDT:HOME — No input for 500ms, servos homed\r\n");
+            }
+        }
+
+        // ── Non-blocking telemetry: skip if print mutex is busy ──
+        // Telemetry stays silent until app sends TELRATE:N after handshake.
+        if (telemetryEnabled && xPrintMutex && xSemaphoreTake(xPrintMutex, 0) == pdTRUE) {
+            printf("TEL,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\r\n",
+                (double)lastServoAngles[0], (double)lastServoAngles[1], (double)lastServoAngles[2],
+                (double)lastServoAngles[3], (double)lastServoAngles[4], (double)lastServoAngles[5],
+                (double)arr[0], (double)arr[1], (double)arr[2],
+                (double)arr[3], (double)arr[4], (double)arr[5]);
+            fflush(stdout);
+            xSemaphoreGive(xPrintMutex);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(telemetryDelayMs));
     }
 }
