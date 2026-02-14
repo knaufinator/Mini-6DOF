@@ -1,0 +1,16 @@
+# Mini-6DOF ESP32 defaults
+# UART0 console (regular ESP32 — no USB Serial JTAG)
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+
+# FreeRTOS
+CONFIG_FREERTOS_HZ=1000
+
+# Watchdog
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=5
+
+# NVS
+CONFIG_NVS_ENCRYPTION=n
+
+# Disable BLE/WiFi by default (can enable later)
+CONFIG_BT_ENABLED=n
+CONFIG_ESP_WIFI_ENABLED=n
