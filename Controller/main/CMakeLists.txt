@@ -6,6 +6,7 @@ idf_component_register(
         "helpers.cpp"
         "InverseKinematics.cpp"
         "AxisScaling.cpp"
+        "MotionCueing.cpp"
         "BleTransport.cpp"
     INCLUDE_DIRS 
         "."
@@ -20,7 +21,7 @@ idf_component_register(
 
 # Enable C++11 support
 set_source_files_properties(
-    main.cpp helpers.cpp InverseKinematics.cpp AxisScaling.cpp BleTransport.cpp
+    main.cpp helpers.cpp InverseKinematics.cpp AxisScaling.cpp MotionCueing.cpp BleTransport.cpp
     PROPERTIES COMPILE_FLAGS "-std=gnu++11"
 )
 

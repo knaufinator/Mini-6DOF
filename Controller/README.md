@@ -10,6 +10,7 @@ Controller/
 │   ├── main.cpp              # app_main entry point, FreeRTOS tasks, command API
 │   ├── InverseKinematics.cpp # Stewart platform IK solver (shared with full-scale)
 │   ├── AxisScaling.cpp       # Per-axis scaling + mapRawToPosition() (shared)
+│   ├── BleTransport.cpp      # BLE GATT server (motion + accel characteristics)
 │   ├── helpers.cpp           # mapfloat utility
 │   └── CMakeLists.txt        # Component build config
 ├── include/
@@ -102,6 +103,26 @@ Default input range: 0–4095 (12-bit). Adjustable via `BITS:N` command.
 
 Comma-separated raw values terminated by `X`. Also used for command queries (e.g. `VERSION?X`).
 
+### BLE (Android App)
+
+The firmware includes a BLE GATT server for wireless control from the Android app. Device name: `Mini6DOF`.
+
+| Characteristic | UUID | Size | Purpose |
+|---------------|------|------|---------|
+| Motion | `0xFF01` | 12 bytes | 6 × uint16 LE (same as serial binary) |
+| Accel | `0xFF03` | 24 bytes | 6 × float32 LE (orientation + accel) |
+
+**Accel characteristic pipeline** (phone-as-controller mode):
+
+```
+BLE [roll°, pitch°, yaw°, surge_ms2, sway_ms2, heave_ms2]
+  → rotation: degrees × DEG_TO_RAD × gain → radians
+  → translation: m/s² × gain → mm
+  → IK → servo angles → pulse width → LEDC
+```
+
+Per-axis gains default to 1.0 for all 6 axes. Connection parameters request 7.5 ms interval for low latency.
+
 ### Processing Pipeline
 
 ```
@@ -155,6 +176,7 @@ These can be kept in sync by copying from the main project. The only platform-sp
 | **MCU** | ESP32 | ESP32-S3 |
 | **Scale** | ~30 mm workspace | ~350 mm workspace |
 | **Actuators** | Direct-drive hobby servos | 750W AC servos + 50:1 planetary |
+| **BLE** | Yes — Android app control (phone-as-controller) | No |
 | **Ethernet** | No | W5500 SPI (opt-in) |
 | **WiFi** | No (can be enabled) | ESP-IDF WiFi STA |
 | **Motion cueing** | Not included | Biquad washout filters |

@@ -35,6 +35,7 @@ typedef enum {
 
 static volatile ble_state_t s_ble_state = BLE_STATE_IDLE;
 static void (*s_packet_callback)(const uint8_t *payload) = NULL;
+static void (*s_accel_callback)(const float *data) = NULL;
 
 // GATT handles
 static uint16_t s_gatts_if = ESP_GATT_IF_NONE;
@@ -42,7 +43,9 @@ static uint16_t s_conn_id = 0;
 static uint16_t s_service_handle = 0;
 static uint16_t s_char_motion_handle = 0;   // writable: receives motion packets
 static uint16_t s_char_status_handle = 0;   // notify: sends status/telemetry
+static uint16_t s_char_accel_handle = 0;    // writable: receives accel packets
 static bool s_notify_enabled = false;
+static int s_char_add_phase = 0;            // tracks which char we're adding
 
 // Service UUID: 42100001-0001-1000-8000-00805f9b34fb
 static uint8_t s_service_uuid[16] = {
@@ -80,7 +83,7 @@ static esp_ble_adv_params_t s_adv_params = {
 
 #define DEVICE_NAME "Mini6DOF"
 #define GATTS_APP_ID 0
-#define GATTS_NUM_HANDLE 8
+#define GATTS_NUM_HANDLE 12
 
 // ── Process received BLE data ────────────────────────────────────────
 
@@ -111,6 +114,23 @@ static void process_ble_write(const uint8_t *data, uint16_t len)
     DEBUG_PRINTLN("BLE: unexpected %d bytes", len);
 }
 
+// ── Process received BLE accel data ──────────────────────────────────
+
+static void process_ble_accel_write(const uint8_t *data, uint16_t len)
+{
+    if (s_accel_callback == NULL) return;
+
+    // Accept 24-byte raw payload: 6 x float32 LE
+    if (len == 24) {
+        float values[6];
+        memcpy(values, data, 24);
+        s_accel_callback(values);
+        return;
+    }
+
+    DEBUG_PRINTLN("BLE accel: unexpected %d bytes", len);
+}
+
 // ── GAP event handler ────────────────────────────────────────────────
 
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
@@ -124,6 +144,9 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                 s_ble_state = BLE_STATE_ADVERTISING;
                 ESP_LOGI(TAG, "BLE advertising started");
             }
+            break;
+        case ESP_GAP_BLE_SET_PKT_LENGTH_COMPLETE_EVT:
+            ESP_LOGI(TAG, "BLE packet length updated");
             break;
         default:
             break;
@@ -154,6 +177,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
         case ESP_GATTS_CREATE_EVT: {
             s_service_handle = param->create.service_handle;
             esp_ble_gatts_start_service(s_service_handle);
+            s_char_add_phase = 0;
 
             // Motion RX characteristic (writable — receives binary motion packets)
             esp_bt_uuid_t motion_uuid = {
@@ -167,11 +191,13 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
         }
 
         case ESP_GATTS_ADD_CHAR_EVT: {
-            if (s_char_motion_handle == 0) {
+            if (s_char_add_phase == 0) {
+                // Phase 0: Motion RX char just added
                 s_char_motion_handle = param->add_char.attr_handle;
                 ESP_LOGI(TAG, "Motion RX char handle: %d", s_char_motion_handle);
+                s_char_add_phase = 1;
 
-                // Status TX characteristic (notify — sends telemetry/status)
+                // Add Status TX characteristic (notify — sends telemetry/status)
                 esp_bt_uuid_t status_uuid = {
                     .len = ESP_UUID_LEN_16,
                     .uuid = { .uuid16 = 0xFF02 },
@@ -179,9 +205,24 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
                 esp_gatt_perm_t status_perm = ESP_GATT_PERM_READ;
                 esp_gatt_char_prop_t status_prop = ESP_GATT_CHAR_PROP_BIT_NOTIFY | ESP_GATT_CHAR_PROP_BIT_READ;
                 esp_ble_gatts_add_char(s_service_handle, &status_uuid, status_perm, status_prop, NULL, NULL);
-            } else {
+            } else if (s_char_add_phase == 1) {
+                // Phase 1: Status TX char just added
                 s_char_status_handle = param->add_char.attr_handle;
                 ESP_LOGI(TAG, "Status TX char handle: %d", s_char_status_handle);
+                s_char_add_phase = 2;
+
+                // Add Accel RX characteristic (writable — receives 24-byte accel packets)
+                esp_bt_uuid_t accel_uuid = {
+                    .len = ESP_UUID_LEN_16,
+                    .uuid = { .uuid16 = 0xFF03 },
+                };
+                esp_gatt_perm_t accel_perm = ESP_GATT_PERM_WRITE;
+                esp_gatt_char_prop_t accel_prop = ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_WRITE_NR;
+                esp_ble_gatts_add_char(s_service_handle, &accel_uuid, accel_perm, accel_prop, NULL, NULL);
+            } else {
+                // Phase 2: Accel RX char just added
+                s_char_accel_handle = param->add_char.attr_handle;
+                ESP_LOGI(TAG, "Accel RX char handle: %d", s_char_accel_handle);
             }
             break;
         }
@@ -198,6 +239,9 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
             conn_params.min_int = 0x0006;  // 7.5ms
             conn_params.timeout = 400;     // 4s
             esp_ble_gap_update_conn_params(&conn_params);
+
+            // Request preferred connection params for higher throughput
+            esp_ble_gap_set_prefer_conn_params(param->connect.remote_bda, 6, 6, 0, 400);
 
             ESP_LOGI(TAG, "BLE client connected (conn_id=%d)", s_conn_id);
             printf("BLE:CONNECTED\r\n");
@@ -218,6 +262,9 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
         case ESP_GATTS_WRITE_EVT: {
             if (param->write.handle == s_char_motion_handle) {
                 process_ble_write(param->write.value, param->write.len);
+            }
+            if (param->write.handle == s_char_accel_handle) {
+                process_ble_accel_write(param->write.value, param->write.len);
             }
             // Handle CCCD write for notifications
             if (param->write.len == 2) {
@@ -279,11 +326,16 @@ bool ble_transport_init(void (*process_packet)(const uint8_t *payload))
     esp_ble_gap_register_callback(gap_event_handler);
     esp_ble_gatts_app_register(GATTS_APP_ID);
 
-    // Set MTU to allow 15-byte packets in a single write
-    esp_ble_gatt_set_local_mtu(23);
+    // Set MTU high enough for 24-byte accel packets + ATT overhead
+    esp_ble_gatt_set_local_mtu(128);
 
-    ESP_LOGI(TAG, "BLE transport initialized, device name: %s", DEVICE_NAME);
+    ESP_LOGI(TAG, "BLE transport initialized, device name: %s (MTU=128)", DEVICE_NAME);
     return true;
+}
+
+void ble_transport_set_accel_callback(void (*process_accel)(const float *data))
+{
+    s_accel_callback = process_accel;
 }
 
 bool ble_transport_connected(void)

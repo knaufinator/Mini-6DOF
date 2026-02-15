@@ -37,10 +37,11 @@
 #include "debug_uart.h"
 #include "InverseKinematics.h"
 #include "AxisScaling.h"
+#include "MotionCueing.h"
 #include "version.h"
 #include "BleTransport.h"
 
-static const char* TAG = "mini6dof";
+static const char* TAG __attribute__((unused)) = "mini6dof";
 
 // ── Debug Output ─────────────────────────────────────────────────────
 #ifdef ENABLE_DEBUG_UART
@@ -60,6 +61,10 @@ static SemaphoreHandle_t xPrintMutex = NULL;
 // ── Platform Configuration ───────────────────────────────────────────
 static StewartConfig stewartConfig;
 static AxisScaleConfig axisScales;
+
+// ── Motion Cueing (for BLE accel input) ──────────────────────────────
+static MotionCueingConfig mcaConfig;
+#define MCA_SAMPLE_RATE 50.0f  // matches servo update rate
 
 // Mini-6DOF specific defaults (geometry in mm, converted from inches)
 static void initMiniDefaults(StewartConfig* cfg) {
@@ -97,6 +102,50 @@ static volatile bool telemetryEnabled = false;  // silent until app sends TELRAT
 static volatile int64_t lastPacketTimeUs = 0;            // esp_timer_get_time() of last motion packet
 #define WATCHDOG_TIMEOUT_US  500000                      // 500ms — home if no input
 static volatile bool watchdogTripped = false;
+
+// ── Input Mode ──────────────────────────────────────────────────────
+typedef enum {
+    INPUT_SERIAL = 0,       // serial binary/CSV motion commands
+    INPUT_BLE_MOTION = 1,   // BLE binary motion commands (Android app)
+    INPUT_BLE_ACCEL = 2,    // BLE raw accel/gyro from phone sensor
+} InputMode;
+static volatile InputMode inputMode = INPUT_SERIAL;
+
+// ── BLE Accel Input ──────────────────────────────────────────────────
+// Raw sensor data from phone: [accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z]
+// Accel in m/s² (Android TYPE_ACCELEROMETER, includes gravity)
+// Gyro in rad/s  (Android TYPE_GYROSCOPE)
+static volatile float accelRaw[6] = {0};
+static volatile bool accelFresh = false;
+static volatile uint32_t accelPacketCount = 0;
+
+// Per-axis gain: maps sensor units to platform physical units
+// Translation axes: mm per G   (e.g. 5.0 = 1G → 5mm displacement)
+// Rotation axes:    rad per rad/s (e.g. 0.15 = 1rad/s → 0.15rad)
+static float accelGain[6] = {
+    1.0f,   // surge (mm per m/s^2 from phone)
+    1.0f,   // sway  (mm per m/s^2 from phone)
+    1.0f,   // heave (mm per m/s^2 from phone)
+    1.0f,   // roll  (1.0 = 1:1 phone-to-platform degrees)
+    1.0f,   // pitch (1.0 = 1:1 phone-to-platform degrees)
+    1.0f,   // yaw   (1.0 = 1:1 phone-to-platform degrees)
+};
+
+// Axis mapping: which phone sensor index maps to each platform axis
+// Phone flat, screen up, top edge forward:
+//   phone X = right, Y = forward, Z = up (matches TYPE_ACCELEROMETER)
+// Positive value = same polarity, negative = inverted
+// abs(value)-1 = source index (1-based to allow sign encoding, 0 = disabled)
+static int8_t accelAxisMap[6] = {
+     2,  // surge  ← phone Y (forward)
+     1,  // sway   ← phone X (right)
+     3,  // heave  ← phone Z (up)
+     4,  // roll   ← gyro X
+     5,  // pitch  ← gyro Y
+     6,  // yaw    ← gyro Z
+};
+
+#define GRAVITY_MS2 9.80665f
 
 // ── Slew-Rate Limiter ────────────────────────────────────────────────
 // Limits maximum position change per servo update cycle to prevent jerks.
@@ -271,6 +320,19 @@ static void applyMotionValues(float position[6]) {
     for (int i = 0; i < 6; i++) {
         ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)i);
     }
+}
+
+// ── BLE Accel Callback ───────────────────────────────────────────────
+// Called from BLE transport when 24-byte accel packet arrives on 0xFF03.
+// Stores raw data and sets fresh flag for main loop processing.
+
+void process_accel_packet(const float* data) {
+    for (int i = 0; i < 6; i++) accelRaw[i] = data[i];
+    accelFresh = true;
+    accelPacketCount++;
+    lastPacketTimeUs = esp_timer_get_time();
+    watchdogTripped = false;
+    inputMode = INPUT_BLE_ACCEL;
 }
 
 // ── Forward Declarations ─────────────────────────────────────────────
@@ -453,6 +515,84 @@ void process_data(char* data) {
         return;
     }
 
+    // ── MCA? — Query motion cueing config ──────────────────────────────
+    if (strcmp(data, "MCA?") == 0) {
+        serial_printf("MCA:preset=%s,enabled=%d,sr=%.0f\r\n",
+            mcaPresetName(mcaConfig.preset), mcaConfig.enabled, mcaConfig.sample_rate);
+        return;
+    }
+
+    // ── MCA:preset_name — Set motion cueing preset ──────────────────
+    if (strncmp(data, "MCA:", 4) == 0) {
+        const char* name = data + 4;
+        if (strcmp(name, "SAVE") == 0) {
+            mcaSaveToNVS(&mcaConfig);
+            serial_printf("MCA:SAVED\r\n");
+            return;
+        }
+        if (strcmp(name, "RESET") == 0) {
+            resetMotionCueing(&mcaConfig);
+            serial_printf("MCA:RESET\r\n");
+            return;
+        }
+        int found = -1;
+        for (int i = 0; i < MCA_PRESET_COUNT; i++) {
+            if (strcmp(name, mcaPresetName(i)) == 0) { found = i; break; }
+        }
+        if (found >= 0) {
+            setMotionCueingPreset(&mcaConfig, found);
+            serial_printf("MCA:OK preset=%s enabled=%d\r\n", mcaPresetName(found), mcaConfig.enabled);
+        } else {
+            serial_printf("MCA:ERR unknown preset '%s' (off/gentle/moderate/aggressive/race_pro)\r\n", name);
+        }
+        return;
+    }
+
+    // ── ACCEL? — Query accel input config ────────────────────────────
+    if (strcmp(data, "ACCEL?") == 0) {
+        serial_printf("ACCEL:gain=%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\r\n",
+            accelGain[0], accelGain[1], accelGain[2],
+            accelGain[3], accelGain[4], accelGain[5]);
+        serial_printf("ACCEL:map=%d,%d,%d,%d,%d,%d\r\n",
+            accelAxisMap[0], accelAxisMap[1], accelAxisMap[2],
+            accelAxisMap[3], accelAxisMap[4], accelAxisMap[5]);
+        serial_printf("ACCEL:mode=%d,packets=%lu,ble=%s\r\n",
+            (int)inputMode, accelPacketCount, ble_transport_state_str());
+        return;
+    }
+
+    // ── ACCEL:GAIN=s,sw,h,r,p,y — Set per-axis accel gains ─────────
+    if (strncmp(data, "ACCEL:GAIN=", 11) == 0) {
+        float g[6];
+        int parsed = sscanf(data + 11, "%f,%f,%f,%f,%f,%f",
+            &g[0], &g[1], &g[2], &g[3], &g[4], &g[5]);
+        if (parsed == 6) {
+            for (int i = 0; i < 6; i++) accelGain[i] = g[i];
+            serial_printf("ACCEL:GAIN=%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\r\n",
+                accelGain[0], accelGain[1], accelGain[2],
+                accelGain[3], accelGain[4], accelGain[5]);
+        } else {
+            serial_printf("ERR:ACCEL:GAIN needs 6 comma-separated values\r\n");
+        }
+        return;
+    }
+
+    // ── ACCEL:MAP=s,sw,h,r,p,y — Set axis mapping (1-based, neg=invert) ─
+    if (strncmp(data, "ACCEL:MAP=", 10) == 0) {
+        int m[6];
+        int parsed = sscanf(data + 10, "%d,%d,%d,%d,%d,%d",
+            &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]);
+        if (parsed == 6) {
+            for (int i = 0; i < 6; i++) accelAxisMap[i] = (int8_t)m[i];
+            serial_printf("ACCEL:MAP=%d,%d,%d,%d,%d,%d\r\n",
+                accelAxisMap[0], accelAxisMap[1], accelAxisMap[2],
+                accelAxisMap[3], accelAxisMap[4], accelAxisMap[5]);
+        } else {
+            serial_printf("ERR:ACCEL:MAP needs 6 comma-separated values\r\n");
+        }
+        return;
+    }
+
     // ── ESTOP:SOFT — Return all servos to center ─────────────────────
     if (strcmp(data, "ESTOP:SOFT") == 0) {
         if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -461,7 +601,7 @@ void process_data(char* data) {
             applyMotionValues(home);
             xSemaphoreGive(xMutex);
         }
-        serial_printf("ESTOP:SOFT — Servos homing to center\r\n");
+        serial_printf("ESTOP:SOFT -- Servos homing to center\r\n");
         return;
     }
 
@@ -472,9 +612,9 @@ void process_data(char* data) {
             for (int i = 0; i < 6; i++) arr[i] = 0;
             applyMotionValues(home);
             xSemaphoreGive(xMutex);
-            serial_printf("ZERO:OK — All servos at center\r\n");
+            serial_printf("ZERO:OK -- All servos at center\r\n");
         } else {
-            serial_printf("ZERO:ERR — Mutex timeout\r\n");
+            serial_printf("ZERO:ERR -- Mutex timeout\r\n");
         }
         return;
     }
@@ -603,10 +743,10 @@ extern "C" void app_main(void) {
     computeAxisScalesFromGeometry(&axisScales, &stewartConfig, 0.90f);
 
     serial_printf("\r\n");
-    serial_printf("╔══════════════════════════════════════════╗\r\n");
-    serial_printf("║     Mini-6DOF Controller v%s          ║\r\n", FW_VERSION_STRING);
-    serial_printf("║     Protocol: %d  Platform: %s   ║\r\n", FW_PROTOCOL_VERSION, FW_PLATFORM_ID);
-    serial_printf("╚══════════════════════════════════════════╝\r\n");
+    serial_printf("+==========================================+\r\n");
+    serial_printf("|     Mini-6DOF Controller v%s          |\r\n", FW_VERSION_STRING);
+    serial_printf("|     Protocol: %d  Platform: %s   |\r\n", FW_PROTOCOL_VERSION, FW_PLATFORM_ID);
+    serial_printf("+==========================================+\r\n");
     serial_printf("Geometry: RD=%.2f PD=%.2f L1=%.2f L2=%.2f H=%.2f\r\n",
         stewartConfig.RD, stewartConfig.PD,
         stewartConfig.ServoArmLengthL1, stewartConfig.ConnectingArmLengthL2,
@@ -657,12 +797,24 @@ extern "C" void app_main(void) {
     );
 
     serial_printf("Serial monitor started. Accepting commands.\r\n");
-    serial_printf("Commands: VERSION? FINGERPRINT? CONFIG? SCALE? BITS? BITS:N ZERO ESTOP:SOFT\r\n");
+    serial_printf("Commands: VERSION? FINGERPRINT? CONFIG? SCALE? BITS:N ZERO ESTOP:SOFT\r\n");
+    serial_printf("         MCA? MCA:preset ACCEL? ACCEL:GAIN= ACCEL:MAP=\r\n");
+
+    // Initialize Motion Cueing (for BLE accel mode)
+    initMotionCueing(&mcaConfig, MCA_SAMPLE_RATE);
+    if (mcaLoadFromNVS(&mcaConfig) == 0) {
+        serial_printf("MCA: Loaded from NVS (preset=%s)\r\n", mcaPresetName(mcaConfig.preset));
+    } else {
+        setMotionCueingPreset(&mcaConfig, MCA_MODERATE);
+        serial_printf("MCA: Default preset=%s\r\n", mcaPresetName(mcaConfig.preset));
+    }
 
     // Initialize BLE transport
 #ifdef ENABLE_BLE
     if (ble_transport_init(process_binary_packet)) {
-        serial_printf("BLE initialized — advertising as 'Mini6DOF'\r\n");
+        ble_transport_set_accel_callback(process_accel_packet);
+        serial_printf("BLE initialized -- advertising as 'Mini6DOF'\r\n");
+        serial_printf("BLE accel char 0xFF03: 24-byte [ax,ay,az,gx,gy,gz] float32 LE\r\n");
     } else {
         serial_printf("BLE init FAILED\r\n");
     }
@@ -671,8 +823,36 @@ extern "C" void app_main(void) {
     // Seed watchdog timer so it doesn't trip immediately on boot
     lastPacketTimeUs = esp_timer_get_time();
 
-    // Main loop: watchdog + telemetry at 10Hz
+    // Main loop: 6-axis processing + watchdog + telemetry
     for (;;) {
+        // ── BLE 6-Axis Pipeline ──────────────────────────────────────
+        // Phone sends [roll_deg, pitch_deg, yaw_deg, surge_ms2, sway_ms2, heave_ms2]
+        // Rotation: degrees → radians, apply gain
+        // Translation: m/s² → mm, apply gain (gain acts as mm-per-m/s²)
+        if (accelFresh && inputMode == INPUT_BLE_ACCEL) {
+            accelFresh = false;
+
+            // Rotation axes: degrees → radians
+            float roll_rad  = accelRaw[0] * DEG_TO_RAD * accelGain[3];
+            float pitch_rad = accelRaw[1] * DEG_TO_RAD * accelGain[4];
+            float yaw_rad   = accelRaw[2] * DEG_TO_RAD * accelGain[5];
+
+            // Translation axes: m/s² → mm (gain = mm per m/s²)
+            float surge_mm = accelRaw[3] * accelGain[0];
+            float sway_mm  = accelRaw[4] * accelGain[1];
+            float heave_mm = accelRaw[5] * accelGain[2];
+
+            // Position: [surge, sway, heave, roll, pitch, yaw]
+            float position[6] = {surge_mm, sway_mm, heave_mm, roll_rad, pitch_rad, yaw_rad};
+
+            // Apply to servos
+            if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                for (int i = 0; i < 6; i++) arr[i] = position[i];
+                applyMotionValues(position);
+                xSemaphoreGive(xMutex);
+            }
+        }
+
         // ── Activity watchdog: home to center if no motion data for 500ms ──
         int64_t now = esp_timer_get_time();
         if (lastPacketTimeUs > 0 && (now - lastPacketTimeUs) > WATCHDOG_TIMEOUT_US) {
@@ -684,7 +864,10 @@ extern "C" void app_main(void) {
                     xSemaphoreGive(xMutex);
                 }
                 watchdogTripped = true;
-                serial_printf("WDT:HOME — No input for 500ms, servos homed\r\n");
+                if (inputMode == INPUT_BLE_ACCEL) {
+                    inputMode = INPUT_SERIAL;  // fall back to serial when accel stops
+                }
+                serial_printf("WDT:HOME -- No input for 500ms, servos homed\r\n");
             }
         }
 

@@ -30,7 +30,7 @@ The `Controller/` firmware is a native ESP-IDF v5.2 project (phoenix branch rewr
 |-----------|----------|
 | `Controller/` | **ESP-IDF v5.2 firmware** (production) — see [Controller/README.md](Controller/README.md) |
 | `MiniServoController/` | Original Arduino sketch (legacy reference, not maintained) |
-| `Android/` | Android BLE controller app (legacy reference, not maintained) |
+| `Android/` | **Android BLE controller app** (Jetpack Compose, phone-as-controller) |
 | `3D Parts/` | STL files for 3D-printed servo mounts and seat rails |
 | `PCB/` | Custom PCB gerbers and BOM |
 | `Images/` | Project photos |
@@ -80,6 +80,56 @@ See [Controller/README.md](Controller/README.md) for full build instructions, pi
 | H | 25.517 | Neutral platform height |
 | θ_r | 10° | Base rotation angle |
 | θ_p | 30° | Platform rotation angle |
+
+## Android App (Phone-as-Controller)
+
+The `Android/` directory contains a Jetpack Compose BLE controller app that turns your phone into a 6-DOF motion controller. The phone's orientation sensors and accelerometer drive the platform in real time over BLE.
+
+### Features
+
+- **6-axis control** — roll, pitch, yaw from phone orientation; surge, sway, heave from accelerometer
+- **Per-axis tuning** — individual enable, scale (0.01–2.0×), and invert toggles for all 6 axes
+- **Max angle clamp** — adjustable 1–6° limit on rotation axes
+- **Live data display** — real-time sent values shown per axis
+- **Send rate** — configurable 1–200 Hz BLE packet rate
+- **Persistent settings** — all axis config saved to SharedPreferences, restored on launch
+- **Zero/reset** — one-tap reference reset and home button
+- **Manual sliders** — 6-axis manual control when not streaming orientation
+
+### BLE Protocol
+
+The app communicates via two BLE characteristics:
+
+| Characteristic | UUID | Payload | Purpose |
+|---------------|------|---------|---------|
+| Motion | `0xFF01` | 12 bytes: 6 × uint16 LE (0–4095) | Manual slider / IMU percent mode |
+| Accel | `0xFF03` | 24 bytes: 6 × float32 LE | Orientation + accel (phone-as-controller) |
+
+**Accel characteristic format** (preferred):
+
+| Float | Field | Unit | Source |
+|-------|-------|------|--------|
+| 0 | Roll | degrees | Phone orientation (game rotation vector) |
+| 1 | Pitch | degrees | Phone orientation |
+| 2 | Yaw | degrees | Phone orientation |
+| 3 | Surge | m/s² | Accelerometer X |
+| 4 | Sway | m/s² | Accelerometer Y |
+| 5 | Heave | m/s² | Accelerometer Z (gravity subtracted) |
+
+### Building the APK
+
+Open `Android/` in Android Studio, sync Gradle, and build. Requires Android SDK 34+ and a phone with BLE + accelerometer + gyroscope.
+
+### Default Axis Config
+
+| Axis | Enabled | Scale | Notes |
+|------|---------|-------|-------|
+| Roll | ✓ | 0.50 | Phone tilt left/right |
+| Pitch | ✓ | 0.50 | Phone tilt forward/back |
+| Yaw | ✗ | 0.50 | Disabled by default (gyro drift) |
+| Surge | ✗ | 0.30 | Phone accel X → platform forward/back |
+| Sway | ✗ | 0.30 | Phone accel Y → platform left/right |
+| Heave | ✗ | 0.30 | Phone accel Z → platform up/down |
 
 ## Communication
 

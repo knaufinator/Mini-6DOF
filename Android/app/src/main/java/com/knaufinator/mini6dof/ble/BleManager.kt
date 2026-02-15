@@ -31,6 +31,7 @@ class BleManager(private val context: Context) {
         val SERVICE_UUID: UUID = UUID.fromString("42100001-0001-1000-8000-00805f9b34fb")
         val MOTION_CHAR_UUID: UUID = UUID.fromString("0000ff01-0000-1000-8000-00805f9b34fb")
         val STATUS_CHAR_UUID: UUID = UUID.fromString("0000ff02-0000-1000-8000-00805f9b34fb")
+        val ACCEL_CHAR_UUID: UUID = UUID.fromString("0000ff03-0000-1000-8000-00805f9b34fb")
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     }
 
@@ -39,6 +40,7 @@ class BleManager(private val context: Context) {
     private var bleScanner: BluetoothLeScanner? = null
     private var bluetoothGatt: BluetoothGatt? = null
     private var motionCharacteristic: BluetoothGattCharacteristic? = null
+    private var accelCharacteristic: BluetoothGattCharacteristic? = null
 
     private val _scannedDevices = MutableStateFlow<List<ScannedDevice>>(emptyList())
     val scannedDevices: StateFlow<List<ScannedDevice>> = _scannedDevices.asStateFlow()
@@ -128,6 +130,7 @@ class BleManager(private val context: Context) {
                     _connectionState.value = ConnectionState.DISCONNECTED
                     _connectedDeviceName.value = null
                     motionCharacteristic = null
+                    accelCharacteristic = null
                     addStatus("Disconnected")
                     gatt.close()
                     bluetoothGatt = null
@@ -155,7 +158,15 @@ class BleManager(private val context: Context) {
                 return
             }
 
-            addStatus("Ready — motion characteristic found")
+            accelCharacteristic = service.getCharacteristic(ACCEL_CHAR_UUID)
+            if (accelCharacteristic != null) {
+                addStatus("Ready — motion + accel characteristics found")
+            } else {
+                addStatus("Ready — motion characteristic found (no accel char — update firmware)")
+            }
+
+            // Request higher MTU for 24-byte accel packets
+            gatt.requestMtu(128)
 
             // Enable notifications on status characteristic
             val statusChar = service.getCharacteristic(STATUS_CHAR_UUID)
@@ -234,6 +245,33 @@ class BleManager(private val context: Context) {
         char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         return gatt.writeCharacteristic(char)
     }
+
+    /**
+     * Send raw accelerometer + gyroscope data as 24-byte payload on accel characteristic.
+     * Data: 6 x float32 LE = [accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z]
+     * Units: m/s² (TYPE_ACCELEROMETER, includes gravity) + rad/s (TYPE_GYROSCOPE)
+     */
+    fun sendAccelPacket(accelX: Float, accelY: Float, accelZ: Float,
+                        gyroX: Float, gyroY: Float, gyroZ: Float): Boolean {
+        val gatt = bluetoothGatt ?: return false
+        val char = accelCharacteristic ?: return false
+        if (_connectionState.value != ConnectionState.CONNECTED) return false
+
+        val buffer = java.nio.ByteBuffer.allocate(24).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        buffer.putFloat(accelX)
+        buffer.putFloat(accelY)
+        buffer.putFloat(accelZ)
+        buffer.putFloat(gyroX)
+        buffer.putFloat(gyroY)
+        buffer.putFloat(gyroZ)
+
+        char.value = buffer.array()
+        char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        return gatt.writeCharacteristic(char)
+    }
+
+    /** Returns true if the connected firmware supports the accel characteristic (0xFF03) */
+    val hasAccelSupport: Boolean get() = accelCharacteristic != null
 
     fun destroy() {
         stopScan()
