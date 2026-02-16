@@ -28,10 +28,9 @@ The `Controller/` firmware is a native ESP-IDF v5.2 project (phoenix branch rewr
 
 | Directory | Contents |
 |-----------|----------|
-| `Controller/` | **ESP-IDF v5.2 firmware** (current) — see [Controller/README.md](Controller/README.md) |
-| `PCBv1/` | **Firmware for the original v1 PCB** — optimized, full docs — see [PCBv1/README.md](PCBv1/README.md) |
-| `Android/` | **Android BLE controller app** (Jetpack Compose, phone-as-controller) |
+| `Controller/` | **ESP-IDF v5.2 firmware** (production) — see [Controller/README.md](Controller/README.md) |
 | `MiniServoController/` | Original Arduino sketch (legacy reference, not maintained) |
+| `Android/` | **Android BLE controller app** (Jetpack Compose, phone-as-controller) |
 | `3D Parts/` | STL files for 3D-printed servo mounts and seat rails |
 | `PCB/` | Custom PCB gerbers and BOM |
 | `Images/` | Project photos |

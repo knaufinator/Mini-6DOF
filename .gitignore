@@ -2,13 +2,9 @@
 Controller/build/
 Controller/sdkconfig
 Controller/sdkconfig.old
-PCBv1/build/
-PCBv1/sdkconfig
-PCBv1/sdkconfig.old
 
 # Managed components (ESP-IDF component manager)
 Controller/managed_components/
-PCBv1/managed_components/
 
 # Editor / IDE
 .vscode/
