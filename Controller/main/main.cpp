@@ -40,6 +40,7 @@
 #include "MotionCueing.h"
 #include "version.h"
 #include "BleTransport.h"
+#include "CobsTransport.h"
 
 static const char* TAG __attribute__((unused)) = "mini6dof";
 
@@ -48,15 +49,8 @@ static const char* TAG __attribute__((unused)) = "mini6dof";
 bool debugEnabled = false;
 #endif
 
-// ── Thread-safe serial printf ────────────────────────────────────────
-static SemaphoreHandle_t xPrintMutex = NULL;
-
-#define serial_printf(fmt, ...) do { \
-    if (xPrintMutex) xSemaphoreTake(xPrintMutex, portMAX_DELAY); \
-    printf(fmt, ##__VA_ARGS__); \
-    fflush(stdout); \
-    if (xPrintMutex) xSemaphoreGive(xPrintMutex); \
-} while(0)
+// ── Thread-safe serial printf (via COBS RESP channel) ───────────────
+#define serial_printf(fmt, ...) cobs_send_fmt(COBS_CH_RESP, fmt, ##__VA_ARGS__)
 
 // ── Platform Configuration ───────────────────────────────────────────
 static StewartConfig stewartConfig;
@@ -108,6 +102,7 @@ typedef enum {
     INPUT_SERIAL = 0,       // serial binary/CSV motion commands
     INPUT_BLE_MOTION = 1,   // BLE binary motion commands (Android app)
     INPUT_BLE_ACCEL = 2,    // BLE raw accel/gyro from phone sensor
+    INPUT_PLAYBACK = 3,     // embedded motion-cued sequence playback (no host)
 } InputMode;
 static volatile InputMode inputMode = INPUT_SERIAL;
 
@@ -205,6 +200,27 @@ static void loadConfigFromNVS() {
             inputBitRange = bits;
             maxRawInput = (float)((1 << bits) - 1);
         }
+        nvs_close(h);
+    }
+}
+
+// ── Play-on-boot flag (NVS) ──────────────────────────────────────────
+// Defaults to ON when unset: the rig is a headless demo that "powers on and
+// autonomously plays the lap" (IMU_PLAYBACK_PLAN goal). PLAY:BOOT=0 disables it.
+static bool loadPlayOnBoot() {
+    nvs_handle_t h; uint8_t v = 1;   // default = auto-play
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u8(h, "play_on_boot", &v);   // overrides default only if key exists
+        nvs_close(h);
+    }
+    return v != 0;
+}
+
+static void savePlayOnBoot(bool on) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "play_on_boot", on ? 1 : 0);
+        nvs_commit(h);
         nvs_close(h);
     }
 }
@@ -338,8 +354,6 @@ void process_accel_packet(const float* data) {
 // ── Forward Declarations ─────────────────────────────────────────────
 void process_data(char* data);
 void process_binary_packet(const uint8_t* payload);
-void processIncomingByte(const uint8_t inByte);
-void InterfaceMonitorTask(void* pvParameters);
 
 // ── Binary Packet Protocol ───────────────────────────────────────────
 // Same 15-byte framed packet as main controller:
@@ -364,6 +378,74 @@ void process_binary_packet(const uint8_t* payload) {
     }
 }
 
+// ── Embedded Sequence Playback ───────────────────────────────────────
+// A motion-cued lap baked offline by the desktop app's export_sequence (see
+// cobra-6dof-mount). File .m6p: 64-byte header {"M6P1", u16 ver, u16 rate,
+// u32 count, u32 loop_point, char name[32], u16 bits @48, u32 crc32 @52} then
+// count × 6×uint16 LE — the exact 12-byte payload process_binary_packet()
+// consumes (wire order, surge/sway already swapped). Playing == streaming that
+// payload at `rate`, so it reuses the whole decode→IK→servo path and, because
+// process_binary_packet() feeds the activity watchdog, playback keeps the rig
+// live with no extra plumbing.
+extern const uint8_t _seq_start[] asm("_binary_laps123_moderate_m6p_start");
+extern const uint8_t _seq_end[]   asm("_binary_laps123_moderate_m6p_end");
+
+static const uint8_t* seqSamples   = nullptr;  // -> first 12-byte sample
+static uint32_t        seqCount     = 0;
+static uint32_t        seqLoopPoint = 0;
+static uint16_t        seqRateHz    = 50;
+static uint16_t        seqBits      = 12;
+static volatile bool     playbackActive = false;
+static volatile bool     playbackLoop   = true;
+static volatile uint32_t playbackIdx    = 0;
+
+static bool parseSequence() {
+    const uint8_t* h = _seq_start;
+    size_t total = (size_t)(_seq_end - _seq_start);
+    if (total < 64 || memcmp(h, "M6P1", 4) != 0) return false;
+    memcpy(&seqRateHz,    h + 6,  2);
+    memcpy(&seqCount,     h + 8,  4);
+    memcpy(&seqLoopPoint, h + 12, 4);
+    memcpy(&seqBits,      h + 48, 2);
+    if (seqRateHz == 0 || seqCount == 0) return false;
+    if ((size_t)64 + (size_t)seqCount * 12 > total) return false;   // truncated
+    if (seqLoopPoint >= seqCount) seqLoopPoint = 0;
+    seqSamples = h + 64;
+    return true;
+}
+
+// Live serial/BLE input takes precedence — cancel playback on any live packet.
+static inline void playbackCancelOnLiveInput() {
+    if (playbackActive) {
+        playbackActive = false;
+        serial_printf("PLAY:STOP -- live input took over\r\n");
+    }
+}
+
+static void PlaybackTask(void* pv) {
+    (void)pv;
+    const TickType_t period = pdMS_TO_TICKS(1000 / (seqRateHz ? seqRateHz : 50));
+    TickType_t last = xTaskGetTickCount();
+    for (;;) {
+        if (playbackActive && seqSamples && seqCount) {
+            // Decode → IK → servo (also refreshes the activity watchdog).
+            process_binary_packet(seqSamples + (size_t)playbackIdx * 12);
+            uint32_t nxt = playbackIdx + 1;
+            if (nxt >= seqCount) {
+                if (playbackLoop) {
+                    nxt = seqLoopPoint;
+                } else {
+                    playbackActive = false;
+                    nxt = 0;
+                    serial_printf("PLAY:DONE\r\n");
+                }
+            }
+            playbackIdx = nxt;
+        }
+        vTaskDelayUntil(&last, period);
+    }
+}
+
 // ── Legacy CSV Parser + Command Handler ──────────────────────────────
 
 void process_data(char* data) {
@@ -375,6 +457,43 @@ void process_data(char* data) {
     } else if (strcmp(data, DEBUG_DISABLE_CMD) == 0) {
         debugEnabled = false;
         serial_printf("Debug output disabled\r\n");
+        return;
+    }
+
+    // ── HIGH-PRIORITY: Handshake commands ──────────────────────────────
+    // These must be at the top so the app's handshake completes instantly.
+    // Any delay here blocks motion — the app won't send packets until
+    // the handshake reaches Ready.
+
+    if (strcmp(data, "FINGERPRINT?") == 0) {
+        uint8_t mac[6];
+        esp_efuse_mac_get_default(mac);
+        serial_printf("FINGERPRINT:%02X%02X%02X%02X%02X%02X,fw=%s,proto=%d,platform=%s\r\n",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            FW_VERSION_STRING, FW_PROTOCOL_VERSION, FW_PLATFORM_ID);
+        return;
+    }
+
+    if (strcmp(data, "CONFIG?") == 0) {
+        serial_printf("CONFIG:RD=%.2f,PD=%.2f,L1=%.2f,L2=%.2f,height=%.2f,theta_r=%.2f,theta_p=%.2f\r\n",
+            stewartConfig.RD, stewartConfig.PD,
+            stewartConfig.ServoArmLengthL1, stewartConfig.ConnectingArmLengthL2,
+            stewartConfig.platformHeight, stewartConfig.theta_r, stewartConfig.theta_p);
+        serial_printf("SERVO:center=%d,%d,%d,%d,%d,%d,pulse_per_rad=%.1f\r\n",
+            servoCenter[0], servoCenter[1], servoCenter[2],
+            servoCenter[3], servoCenter[4], servoCenter[5], servoPulsePerRad);
+        return;
+    }
+
+    if (strcmp(data, "BITS?") == 0) {
+        serial_printf("BITS:%d,max_raw=%.0f\r\n", inputBitRange, maxRawInput);
+        return;
+    }
+
+    if (strcmp(data, "VERSION?") == 0) {
+        serial_printf("VERSION:%s,proto=%d,platform=%s,date=%s,time=%s\r\n",
+            FW_VERSION_STRING, FW_PROTOCOL_VERSION, FW_PLATFORM_ID,
+            FW_BUILD_DATE, FW_BUILD_TIME);
         return;
     }
 
@@ -397,42 +516,6 @@ void process_data(char* data) {
         } else {
             serial_printf("ERR:BITS range 8-16\r\n");
         }
-        return;
-    }
-
-    // ── BITS? — Query current input bit depth ────────────────────────
-    if (strcmp(data, "BITS?") == 0) {
-        serial_printf("BITS:%d,max_raw=%.0f\r\n", inputBitRange, maxRawInput);
-        return;
-    }
-
-    // ── VERSION? — Report firmware version + protocol version ────────
-    if (strcmp(data, "VERSION?") == 0) {
-        serial_printf("VERSION:%s,proto=%d,platform=%s,date=%s,time=%s\r\n",
-            FW_VERSION_STRING, FW_PROTOCOL_VERSION, FW_PLATFORM_ID,
-            FW_BUILD_DATE, FW_BUILD_TIME);
-        return;
-    }
-
-    // ── FINGERPRINT? — Unique device identity for handshake ──────────
-    if (strcmp(data, "FINGERPRINT?") == 0) {
-        uint8_t mac[6];
-        esp_efuse_mac_get_default(mac);
-        serial_printf("FINGERPRINT:%02X%02X%02X%02X%02X%02X,fw=%s,proto=%d,platform=%s\r\n",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-            FW_VERSION_STRING, FW_PROTOCOL_VERSION, FW_PLATFORM_ID);
-        return;
-    }
-
-    // ── CONFIG? — Query full platform geometry ───────────────────────
-    if (strcmp(data, "CONFIG?") == 0) {
-        serial_printf("CONFIG:RD=%.2f,PD=%.2f,L1=%.2f,L2=%.2f,height=%.2f,theta_r=%.2f,theta_p=%.2f\r\n",
-            stewartConfig.RD, stewartConfig.PD,
-            stewartConfig.ServoArmLengthL1, stewartConfig.ConnectingArmLengthL2,
-            stewartConfig.platformHeight, stewartConfig.theta_r, stewartConfig.theta_p);
-        serial_printf("SERVO:center=%d,%d,%d,%d,%d,%d,pulse_per_rad=%.1f\r\n",
-            servoCenter[0], servoCenter[1], servoCenter[2],
-            servoCenter[3], servoCenter[4], servoCenter[5], servoPulsePerRad);
         return;
     }
 
@@ -595,6 +678,7 @@ void process_data(char* data) {
 
     // ── ESTOP:SOFT — Return all servos to center ─────────────────────
     if (strcmp(data, "ESTOP:SOFT") == 0) {
+        playbackActive = false;   // E-stop overrides playback
         if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             float home[6] = {0, 0, 0, 0, 0, 0};
             for (int i = 0; i < 6; i++) arr[i] = 0;
@@ -619,6 +703,48 @@ void process_data(char* data) {
         return;
     }
 
+    // ── PLAY:* — Embedded motion-cued sequence playback ──────────────
+    // PLAY:START | PLAY:STOP | PLAY:LOOP=0/1 | PLAY:STATUS | PLAY:BOOT=0/1
+    if (strncmp(data, "PLAY:", 5) == 0) {
+        const char* arg = data + 5;
+        if (strcmp(arg, "START") == 0) {
+            if (!seqSamples) { serial_printf("PLAY:ERR no sequence\r\n"); return; }
+            // Decode the sequence with the bit depth it was baked for.
+            inputBitRange = (uint8_t)seqBits;
+            maxRawInput   = (float)((1 << seqBits) - 1);
+            playbackIdx = 0;
+            playbackActive = true;
+            inputMode = INPUT_PLAYBACK;
+            lastPacketTimeUs = esp_timer_get_time();
+            serial_printf("PLAY:START %u samples @ %uHz (%d-bit)\r\n",
+                          (unsigned)seqCount, (unsigned)seqRateHz, seqBits);
+        } else if (strcmp(arg, "STOP") == 0) {
+            playbackActive = false;
+            if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                float home[6] = {0, 0, 0, 0, 0, 0};
+                for (int i = 0; i < 6; i++) arr[i] = 0;
+                applyMotionValues(home);
+                xSemaphoreGive(xMutex);
+            }
+            inputMode = INPUT_SERIAL;
+            serial_printf("PLAY:STOP\r\n");
+        } else if (strncmp(arg, "LOOP=", 5) == 0) {
+            playbackLoop = atoi(arg + 5) != 0;
+            serial_printf("PLAY:LOOP=%d\r\n", playbackLoop ? 1 : 0);
+        } else if (strcmp(arg, "STATUS") == 0) {
+            serial_printf("PLAY:STATUS active=%d idx=%u/%u rate=%u loop=%d boot=%d\r\n",
+                playbackActive ? 1 : 0, (unsigned)playbackIdx, (unsigned)seqCount,
+                (unsigned)seqRateHz, playbackLoop ? 1 : 0, loadPlayOnBoot() ? 1 : 0);
+        } else if (strncmp(arg, "BOOT=", 5) == 0) {
+            bool on = atoi(arg + 5) != 0;
+            savePlayOnBoot(on);
+            serial_printf("PLAY:BOOT=%d\r\n", on ? 1 : 0);
+        } else {
+            serial_printf("PLAY:ERR unknown '%s'\r\n", arg);
+        }
+        return;
+    }
+
     // ── CSV motion data: val0,val1,val2,val3,val4,val5 ───────────────
     // Parse comma-separated raw values (legacy protocol)
     float raw[6] = {0};
@@ -630,6 +756,7 @@ void process_data(char* data) {
     }
 
     if (count == 6) {
+        playbackCancelOnLiveInput();
         float position[6];
         mapRawToPosition(raw, &axisScales, maxRawInput, position);
 
@@ -643,81 +770,17 @@ void process_data(char* data) {
     }
 }
 
-// ── Serial Byte Processing ───────────────────────────────────────────
-
-// Binary packet state machine
-static enum { WAIT_SYNC1, WAIT_SYNC2, READ_PAYLOAD } binState = WAIT_SYNC1;
-static uint8_t binPayload[13]; // 12 data bytes + 1 checksum
-static int binPos = 0;
-
-void processIncomingByte(const uint8_t inByte) {
-    // Binary packet detection: 0xAA 0x55 header
-    switch (binState) {
-        case WAIT_SYNC1:
-            if (inByte == 0xAA) { binState = WAIT_SYNC2; return; }
-            break;  // not 0xAA — fall through to ASCII parser
-        case WAIT_SYNC2:
-            if (inByte == 0x55) { binState = READ_PAYLOAD; binPos = 0; return; }
-            binState = WAIT_SYNC1;
-            break;  // not 0x55 — fall through to ASCII parser (false sync)
-        case READ_PAYLOAD:
-            binPayload[binPos++] = inByte;
-            if (binPos >= 13) {
-                // Verify XOR checksum
-                uint8_t xorCheck = 0;
-                for (int i = 0; i < 12; i++) xorCheck ^= binPayload[i];
-                if (xorCheck == binPayload[12]) {
-                    process_binary_packet(binPayload);
-                }
-                binState = WAIT_SYNC1;
-            }
-            return; // don't feed binary bytes to ASCII parser
-    }
-
-    // Legacy ASCII path: accumulate until 'X' terminator
-    static char input_line[MAX_SERIAL_INPUT];
-    static unsigned int input_pos = 0;
-
-    if (inByte == 'X') {
-        input_line[input_pos] = 0;
-        process_data(input_line);
-        input_pos = 0;
-    } else if (inByte == '\r' || inByte == '\n') {
-        // Also accept newline as terminator for command queries
-        if (input_pos > 0) {
-            input_line[input_pos] = 0;
-            // Only process as command if it looks like a query (contains '?' or ':')
-            if (strchr(input_line, '?') || strchr(input_line, ':')) {
-                process_data(input_line);
-            }
-            input_pos = 0;
-        }
-    } else {
-        if (input_pos < (MAX_SERIAL_INPUT - 1))
-            input_line[input_pos++] = inByte;
-    }
-}
-
-// ── Interface Monitor Task (Core 0: serial I/O) ─────────────────────
+// ── Interface Monitor Task (Core 0: serial I/O via COBS) ─────────────
 
 void InterfaceMonitorTask(void* pvParameters) {
-    // Open stdin for reading
-    int fd = open("/dev/console", O_RDONLY | O_NONBLOCK);
-    if (fd < 0) {
-        // Fallback: try stdin fd 0
-        fd = STDIN_FILENO;
-    }
-
-    uint8_t buf[64];
     for (;;) {
-        int n = read(fd, buf, sizeof(buf));
-        if (n > 0) {
-            for (int i = 0; i < n; i++) {
-                processIncomingByte(buf[i]);
-            }
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(1));
-        }
+        // COBS transport: read bytes, decode frames, dispatch to registered handlers
+        // (data_handler → process_binary_packet, cmd_handler → process_data)
+        int got = cobs_read_process(5);
+
+        // Yield when no data — prevents tight busy-loop from starving core 0
+        if (got == 0)
+            vTaskDelay(1);
     }
 }
 
@@ -733,7 +796,19 @@ extern "C" void app_main(void) {
 
     // Create mutexes
     xMutex = xSemaphoreCreateMutex();
-    xPrintMutex = xSemaphoreCreateMutex();
+
+    // Initialize COBS transport on UART0 (must be before any serial_printf)
+    cobs_transport_init(921600);
+    cobs_set_data_handler([](const uint8_t *payload, int len) {
+        (void)len;
+        playbackCancelOnLiveInput();   // live host motion overrides playback
+        process_binary_packet(payload);
+    });
+    cobs_set_cmd_handler([](const char *cmd) {
+        char buf[256];
+        int n = snprintf(buf, sizeof(buf), "%s", cmd);
+        if (n > 0) process_data(buf);
+    });
 
     // Initialize platform config with Mini-6DOF defaults, then overlay NVS
     initMiniDefaults(&stewartConfig);
@@ -820,6 +895,28 @@ extern "C" void app_main(void) {
     }
 #endif
 
+    // ── Embedded motion-cued sequence playback ───────────────────────
+    if (parseSequence()) {
+        serial_printf("PLAY: sequence ready -- %u samples @ %uHz, %d-bit, loop@%u (~%.1fs)\r\n",
+            (unsigned)seqCount, (unsigned)seqRateHz, seqBits, (unsigned)seqLoopPoint,
+            (double)seqCount / (seqRateHz ? seqRateHz : 50));
+        // Playback runs on APP_CPU (core 1) at a fixed rate, clear of the
+        // serial monitor + main loop on core 0.
+        xTaskCreatePinnedToCore(PlaybackTask, "Playback", 4096, NULL, 6, NULL, 1);
+        if (loadPlayOnBoot()) {
+            inputBitRange = (uint8_t)seqBits;
+            maxRawInput   = (float)((1 << seqBits) - 1);
+            playbackIdx = 0;
+            playbackActive = true;
+            inputMode = INPUT_PLAYBACK;
+            serial_printf("PLAY: auto-start (play_on_boot=1)\r\n");
+        } else {
+            serial_printf("PLAY: idle -- send PLAY:START or set PLAY:BOOT=1\r\n");
+        }
+    } else {
+        serial_printf("PLAY: no valid embedded sequence\r\n");
+    }
+
     // Seed watchdog timer so it doesn't trip immediately on boot
     lastPacketTimeUs = esp_timer_get_time();
 
@@ -871,16 +968,12 @@ extern "C" void app_main(void) {
             }
         }
 
-        // ── Non-blocking telemetry: skip if print mutex is busy ──
+        // ── Binary COBS telemetry ──
         // Telemetry stays silent until app sends TELRATE:N after handshake.
-        if (telemetryEnabled && xPrintMutex && xSemaphoreTake(xPrintMutex, 0) == pdTRUE) {
-            printf("TEL,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\r\n",
-                (double)lastServoAngles[0], (double)lastServoAngles[1], (double)lastServoAngles[2],
-                (double)lastServoAngles[3], (double)lastServoAngles[4], (double)lastServoAngles[5],
-                (double)arr[0], (double)arr[1], (double)arr[2],
-                (double)arr[3], (double)arr[4], (double)arr[5]);
-            fflush(stdout);
-            xSemaphoreGive(xPrintMutex);
+        if (telemetryEnabled) {
+            float positions[6];
+            for (int i = 0; i < 6; i++) positions[i] = arr[i];
+            cobs_send_telemetry((const float*)lastServoAngles, positions);
         }
 
         vTaskDelay(pdMS_TO_TICKS(telemetryDelayMs));

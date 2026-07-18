@@ -1,6 +1,7 @@
 #ifdef ENABLE_BLE
 
 #include "BleTransport.h"
+#include "CobsTransport.h"
 #include "helpers.h"
 #include "debug_uart.h"
 
@@ -244,8 +245,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
             esp_ble_gap_set_prefer_conn_params(param->connect.remote_bda, 6, 6, 0, 400);
 
             ESP_LOGI(TAG, "BLE client connected (conn_id=%d)", s_conn_id);
-            printf("BLE:CONNECTED\r\n");
-            fflush(stdout);
+            cobs_send_fmt(COBS_CH_LOG, "BLE:CONNECTED");
             break;
         }
 
@@ -253,8 +253,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
             s_ble_state = BLE_STATE_ADVERTISING;
             s_notify_enabled = false;
             ESP_LOGI(TAG, "BLE client disconnected, restarting advertising");
-            printf("BLE:DISCONNECTED\r\n");
-            fflush(stdout);
+            cobs_send_fmt(COBS_CH_LOG, "BLE:DISCONNECTED");
             esp_ble_gap_start_advertising(&s_adv_params);
             break;
         }

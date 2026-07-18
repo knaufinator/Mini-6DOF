@@ -1,6 +1,13 @@
 # Mini-6DOF ESP32 defaults
 # UART0 console (regular ESP32 — no USB Serial JTAG)
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
+
+# Flash + custom partition table — the ~275KB embedded playback sequence needs a
+# factory app partition larger than the stock 1MB single-app layout.
+CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # FreeRTOS
 CONFIG_FREERTOS_HZ=1000
