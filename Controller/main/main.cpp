@@ -56,9 +56,45 @@ bool debugEnabled = false;
 static StewartConfig stewartConfig;
 static AxisScaleConfig axisScales;
 
-// ── Motion Cueing (for BLE accel input) ──────────────────────────────
+// ── Motion Cueing (shared on-device cue engine) ──────────────────────
 static MotionCueingConfig mcaConfig;
-#define MCA_SAMPLE_RATE 50.0f  // matches servo update rate
+static InputFilterConfig  inputFilter;   // pre-MCA signal conditioning
+#define MCA_SAMPLE_RATE 50.0f  // seed; retuned to servoRateHz once configured
+
+// ── Servo-rate profile (runtime, NVS-persisted) ──────────────────────
+// The mini ships with ANALOG servos (SG90/MG996R class) that physically
+// latch once per PWM frame; driving them at 250 Hz would damage them, so the
+// default carrier is 50 Hz. A digital-servo upgrade (DS3218) accepts 250 Hz,
+// unlocking the high-fidelity path. ONE knob sets BOTH the LEDC carrier AND
+// the CueTask loop rate (they must match); switch with SERVO:RATE / SERVO:MODE
+// at runtime — no reflash. cueLoopHz == servoRateHz.
+#define SERVO_RATE_ANALOG_HZ   50
+#define SERVO_RATE_DIGITAL_HZ  250
+#define SERVO_RATE_MIN_HZ      20
+#define SERVO_RATE_MAX_HZ      333
+static volatile uint16_t servoRateHz    = SERVO_RATE_ANALOG_HZ;   // default = analog/safe
+static volatile float    servoPeriodUs  = 1000000.0f / SERVO_RATE_ANALOG_HZ;
+
+// ── On-device cue engine: shared latest-sample target (hold-only) ─────
+// Ingest paths (CH_DATA, CH_DATA_RAW, PlaybackTask, BLE) STOP driving IK/servo
+// and just write the freshest sample here + an esp_timer receive-stamp. The
+// fixed-rate CueTask is the SOLE servo writer: it reads this, runs the cue
+// chain (for RAW), maps to position, per-time slews, IK, and writes servos.
+// (MCU_HIFI_CUEING.md "DECISIONS APPLIED" hold-only variant.)
+typedef enum {
+    TGT_BAKED = 0,   // raw uint16 counts, cue already baked -> mapRawToPosition only
+    TGT_RAW   = 1,   // pre-cue telemetry -> inputFilter -> MCA -> outputStage -> mapRawToPosition
+    TGT_PHYS  = 2,   // already physical mm/rad (BLE accel) -> straight to slew/IK
+} TargetFmt;
+static portMUX_TYPE g_targetMux = portMUX_INITIALIZER_UNLOCKED;
+static float   g_targetCh[6]  = {0, 0, 0, 0, 0, 0};
+static int64_t g_targetTsUs   = 0;
+static int     g_targetFmt    = TGT_BAKED;
+
+// Stale/lost ladder (hold-only): beyond LOST, CueTask decays to home so the
+// platform never parks at a stale tilt. HOLD (< LOST) keeps feeding the last
+// sample; the washout HP naturally returns RAW motion toward center.
+#define CUE_LOST_DECAY_MS  300
 
 // Mini-6DOF specific defaults (geometry in mm, converted from inches)
 static void initMiniDefaults(StewartConfig* cfg) {
@@ -106,6 +142,18 @@ typedef enum {
 } InputMode;
 static volatile InputMode inputMode = INPUT_SERIAL;
 
+// ── Motion Source (OFF / DEMO / LIVE) ────────────────────────────────
+// The "easy button" selector (HIL_BRIDGE.md). OFF homes + gates all motion
+// (one-tap kill); DEMO plays the embedded sequence; LIVE accepts streamed
+// motion (CH_DATA baked or CH_DATA_RAW pre-cue). Persists a boot default in
+// NVS (generalizes the old play_on_boot). Default boot source = DEMO.
+typedef enum {
+    SRC_OFF  = 0,   // motion off: home + ignore incoming motion (safe idle)
+    SRC_DEMO = 1,   // on-device embedded playback (PlaybackTask)
+    SRC_LIVE = 2,   // accept streamed motion (CH_DATA / CH_DATA_RAW)
+} Source;
+static volatile Source g_source = SRC_DEMO;
+
 // ── BLE Accel Input ──────────────────────────────────────────────────
 // Raw sensor data from phone: [accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z]
 // Accel in m/s² (Android TYPE_ACCELEROMETER, includes gravity)
@@ -142,10 +190,12 @@ static int8_t accelAxisMap[6] = {
 
 #define GRAVITY_MS2 9.80665f
 
-// ── Slew-Rate Limiter ────────────────────────────────────────────────
-// Limits maximum position change per servo update cycle to prevent jerks.
-// Units: physical (mm or rad) per call. At ~50Hz servo rate this is per 20ms.
-#define SLEW_RATE_MAX   5.0f                             // mm (or rad) per cycle — fast tracking, app handles S-curve ramp
+// ── Slew-Rate Limiter (per-TIME, rate-independent) ───────────────────
+// FIX TRAP B (MCU_HIFI_CUEING.md §2): the old limit was per-CALL (5 units/
+// cycle) which silently assumed 50 Hz. At 250 Hz that would be ~5x harsher.
+// Express it as units/SECOND and multiply by dt so it's identical in feel at
+// any cueLoopHz. 250 units/s == the old 5 units × 50 Hz.
+#define SLEW_RATE_MAX_PER_S   250.0f                     // mm (or rad) per SECOND
 static float smoothedPosition[6] = {0};                  // current smoothed output
 static bool smoothingInitialized = false;
 
@@ -178,6 +228,8 @@ static void saveConfigToNVS() {
         nvs_set_blob(h, "pulse_per_rad", &servoPulsePerRad, sizeof(servoPulsePerRad));
         nvs_set_blob(h, "geometry", &stewartConfig, sizeof(stewartConfig));
         nvs_set_u8(h, "bit_depth", inputBitRange);
+        uint16_t sr = servoRateHz;
+        nvs_set_blob(h, "servo_rate", &sr, sizeof(sr));
         nvs_commit(h);
         nvs_close(h);
     }
@@ -200,29 +252,49 @@ static void loadConfigFromNVS() {
             inputBitRange = bits;
             maxRawInput = (float)((1 << bits) - 1);
         }
+        uint16_t sr = 0; sz = sizeof(sr);
+        if (nvs_get_blob(h, "servo_rate", &sr, &sz) == ESP_OK &&
+            sr >= SERVO_RATE_MIN_HZ && sr <= SERVO_RATE_MAX_HZ) {
+            servoRateHz   = sr;
+            servoPeriodUs = 1000000.0f / (float)sr;
+        }
         nvs_close(h);
     }
 }
 
-// ── Play-on-boot flag (NVS) ──────────────────────────────────────────
-// Defaults to ON when unset: the rig is a headless demo that "powers on and
-// autonomously plays the lap" (IMU_PLAYBACK_PLAN goal). PLAY:BOOT=0 disables it.
-static bool loadPlayOnBoot() {
-    nvs_handle_t h; uint8_t v = 1;   // default = auto-play
+// ── Boot source (NVS) ────────────────────────────────────────────────
+// Generalizes the old play_on_boot flag into the OFF/DEMO/LIVE source model.
+// Default = DEMO: the rig is a headless demo that "powers on and autonomously
+// plays the lap" (DECISIONS r3). SOURCE:BOOT=OFF|DEMO|LIVE sets it; PLAY:BOOT=0
+// (OFF) / PLAY:BOOT=1 (DEMO) stay as aliases. Reads the legacy play_on_boot key
+// as a fallback so an already-flashed device keeps its setting.
+static Source loadBootSource() {
+    nvs_handle_t h;
+    Source src = SRC_DEMO;   // default
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
-        nvs_get_u8(h, "play_on_boot", &v);   // overrides default only if key exists
+        uint8_t v;
+        if (nvs_get_u8(h, "boot_source", &v) == ESP_OK) {
+            src = (v <= SRC_LIVE) ? (Source)v : SRC_DEMO;
+        } else if (nvs_get_u8(h, "play_on_boot", &v) == ESP_OK) {
+            src = v ? SRC_DEMO : SRC_OFF;    // legacy fallback
+        }
         nvs_close(h);
     }
-    return v != 0;
+    return src;
 }
 
-static void savePlayOnBoot(bool on) {
+static void saveBootSource(Source src) {
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_u8(h, "play_on_boot", on ? 1 : 0);
+        nvs_set_u8(h, "boot_source", (uint8_t)src);
         nvs_commit(h);
         nvs_close(h);
     }
+}
+
+static const char* sourceName(Source s) {
+    switch (s) { case SRC_OFF: return "OFF"; case SRC_DEMO: return "DEMO";
+                 case SRC_LIVE: return "LIVE"; default: return "?"; }
 }
 
 // ── LEDC PWM Setup ──────────────────────────────────────────────────
@@ -233,12 +305,13 @@ static void savePlayOnBoot(bool on) {
 #define LEDC_TIMER_MAX    65535
 
 static void setupServoPWM() {
-    // Configure LEDC timer
+    // Configure LEDC timer at the current servo-rate profile (default 50 Hz).
+    // 16-bit resolution is valid for both 50 Hz and 250 Hz (80MHz/2^16 ≈ 1.2kHz max).
     ledc_timer_config_t timer_conf = {};
     timer_conf.speed_mode = LEDC_LOW_SPEED_MODE;
     timer_conf.timer_num = LEDC_TIMER_0;
     timer_conf.duty_resolution = LEDC_TIMER_BITS;
-    timer_conf.freq_hz = SERVO_FREQ_HZ;
+    timer_conf.freq_hz = servoRateHz;
     timer_conf.clk_cfg = LEDC_AUTO_CLK;
     ledc_timer_config(&timer_conf);
 
@@ -256,11 +329,11 @@ static void setupServoPWM() {
     }
 }
 
-// Convert microseconds to LEDC duty value
+// Convert microseconds to LEDC duty value.
+// duty = (us / period_us) * max_duty, where period_us tracks the servo rate
+// (20000us @ 50Hz, 4000us @ 250Hz) so pulse widths stay absolute microseconds.
 static uint32_t usToDuty(int us) {
-    // duty = (us / period_us) * max_duty
-    // period_us = 1000000 / 50 = 20000
-    return (uint32_t)((float)us / 20000.0f * (float)LEDC_TIMER_MAX);
+    return (uint32_t)((float)us / servoPeriodUs * (float)LEDC_TIMER_MAX);
 }
 
 // Set servo pulse width in microseconds
@@ -275,30 +348,33 @@ static void setServoPulse(int channel, int us) {
 // Applies per-axis slew-rate limiting to prevent servo jerk from large steps.
 // Returns the smoothed position in `out[6]`.
 
-static void slewRateLimit(const float target[6], float out[6]) {
+static void slewRateLimit(const float target[6], float out[6], float dt) {
     if (!smoothingInitialized) {
         memcpy(smoothedPosition, target, sizeof(smoothedPosition));
         smoothingInitialized = true;
     }
+    const float maxStep = SLEW_RATE_MAX_PER_S * dt;   // per-time -> per-call
     for (int i = 0; i < 6; i++) {
         float delta = target[i] - smoothedPosition[i];
-        if (delta > SLEW_RATE_MAX) delta = SLEW_RATE_MAX;
-        else if (delta < -SLEW_RATE_MAX) delta = -SLEW_RATE_MAX;
+        if (delta > maxStep) delta = maxStep;
+        else if (delta < -maxStep) delta = -maxStep;
         smoothedPosition[i] += delta;
         out[i] = smoothedPosition[i];
     }
 }
 
-// ── Apply Motion Values ──────────────────────────────────────────────
-// Improvements over original:
-//   1. Slew-rate limiting prevents servo jerk from large position steps
+// ── Drive Servos (slew + IK + LEDC write) ────────────────────────────
+// The low-level actuator stage. Called ONLY from CueTask (the sole servo
+// writer) once tasks are running, plus directly at boot before CueTask starts.
+//   1. Per-time slew-rate limiting prevents servo jerk from large steps
 //   2. IK output validated (NaN / out-of-range clamped)
 //   3. Atomic servo update: all 6 duties set first, then all 6 updated
+// `dt` is the loop period in seconds (1/cueLoopHz) for the per-time slew.
 
-static void applyMotionValues(float position[6]) {
-    // Slew-rate limit the input position
+static void driveServos(float position[6], float dt) {
+    // Slew-rate limit the input position (rate-independent)
     float limited[6];
-    slewRateLimit(position, limited);
+    slewRateLimit(position, limited, dt);
 
     // Run inverse kinematics
     float angles[6];
@@ -338,6 +414,52 @@ static void applyMotionValues(float position[6]) {
     }
 }
 
+// ── Shared latest-sample handoff (producers -> CueTask) ──────────────
+// Ingest paths call these instead of driving servos. Zero-order hold: the
+// CueTask always reads the freshest sample under a short critical section.
+static void writeTarget(const float ch[6], int fmt) {
+    int64_t t = esp_timer_get_time();
+    taskENTER_CRITICAL(&g_targetMux);
+    for (int i = 0; i < 6; i++) g_targetCh[i] = ch[i];
+    g_targetTsUs = t;
+    g_targetFmt  = fmt;
+    taskEXIT_CRITICAL(&g_targetMux);
+    lastPacketTimeUs = t;
+    watchdogTripped  = false;
+}
+static void readTarget(float ch[6], int64_t* ts, int* fmt) {
+    taskENTER_CRITICAL(&g_targetMux);
+    for (int i = 0; i < 6; i++) ch[i] = g_targetCh[i];
+    *ts  = g_targetTsUs;
+    *fmt = g_targetFmt;
+    taskEXIT_CRITICAL(&g_targetMux);
+}
+
+// ── Servo-rate profile applier ───────────────────────────────────────
+// Sets BOTH the LEDC carrier and the CueTask loop rate (cueLoopHz) together,
+// and retunes the biquads (FIX TRAP A) so filters match the new loop rate.
+// Safe to call at runtime; CueTask picks up the new period on its next tick.
+static void applyServoRate(uint16_t hz) {
+    if (hz < SERVO_RATE_MIN_HZ) hz = SERVO_RATE_MIN_HZ;
+    if (hz > SERVO_RATE_MAX_HZ) hz = SERVO_RATE_MAX_HZ;
+    servoRateHz   = hz;
+    servoPeriodUs = 1000000.0f / (float)hz;
+
+    // Re-init the LEDC timer to the new carrier frequency.
+    ledc_timer_config_t timer_conf = {};
+    timer_conf.speed_mode     = LEDC_LOW_SPEED_MODE;
+    timer_conf.timer_num      = LEDC_TIMER_0;
+    timer_conf.duty_resolution= LEDC_TIMER_BITS;
+    timer_conf.freq_hz        = hz;
+    timer_conf.clk_cfg        = LEDC_AUTO_CLK;
+    ledc_timer_config(&timer_conf);
+
+    // FIX TRAP A: biquads are rate-dependent (ω = 2π·fc/fs) — retune to the
+    // loop rate (== servoRateHz), NOT the telemetry/seq rate.
+    mcaUpdateSampleRate(&mcaConfig, (float)hz);
+    inputFilterUpdateSampleRate(&inputFilter, (float)hz);
+}
+
 // ── BLE Accel Callback ───────────────────────────────────────────────
 // Called from BLE transport when 24-byte accel packet arrives on 0xFF03.
 // Stores raw data and sets fresh flag for main loop processing.
@@ -354,28 +476,32 @@ void process_accel_packet(const float* data) {
 // ── Forward Declarations ─────────────────────────────────────────────
 void process_data(char* data);
 void process_binary_packet(const uint8_t* payload);
+void process_raw_packet(const uint8_t* payload);
+static void setSource(Source s);
 
 // ── Binary Packet Protocol ───────────────────────────────────────────
 // Same 15-byte framed packet as main controller:
 // [0xAA][0x55][ch0_lo][ch0_hi][ch1_lo]...[ch5_hi][xor_checksum]  (little-endian)
 
+// Baked 6×uint16 frame (CH_DATA / M6P1 playback). Producer only: decode and
+// hand the latest sample to CueTask as TGT_BAKED (cue already applied on the
+// desktop, so CueTask runs mapRawToPosition only — no double-cueing).
 void process_binary_packet(const uint8_t* payload) {
     float raw[6];
     for (int i = 0; i < 6; i++) {
         uint16_t val = (uint16_t)payload[i * 2] | ((uint16_t)payload[i * 2 + 1] << 8);
         raw[i] = (float)val;
     }
+    writeTarget(raw, TGT_BAKED);
+}
 
-    float position[6];
-    mapRawToPosition(raw, &axisScales, maxRawInput, position);
-
-    if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        for (int i = 0; i < 6; i++) arr[i] = position[i];
-        applyMotionValues(position);
-        lastPacketTimeUs = esp_timer_get_time();
-        watchdogTripped = false;
-        xSemaphoreGive(xMutex);
-    }
+// RAW pre-cue frame: 6×float32 LE = 24 bytes (CH_DATA_RAW / M6P2 playback).
+// Producer only: CueTask runs the full cue chain (inputFilter -> MCA ->
+// outputStage -> mapRawToPosition) at cueLoopHz.
+void process_raw_packet(const uint8_t* payload) {
+    float raw[6];
+    memcpy(raw, payload, 6 * sizeof(float));   // LE float32, wire order
+    writeTarget(raw, TGT_RAW);
 }
 
 // ── Embedded Sequence Playback ───────────────────────────────────────
@@ -390,46 +516,78 @@ void process_binary_packet(const uint8_t* payload) {
 extern const uint8_t _seq_start[] asm("_binary_laps123_moderate_m6p_start");
 extern const uint8_t _seq_end[]   asm("_binary_laps123_moderate_m6p_end");
 
-static const uint8_t* seqSamples   = nullptr;  // -> first 12-byte sample
+static const uint8_t* seqSamples   = nullptr;  // -> first sample
 static uint32_t        seqCount     = 0;
 static uint32_t        seqLoopPoint = 0;
 static uint16_t        seqRateHz    = 50;
 static uint16_t        seqBits      = 12;
+static uint16_t        seqStride    = 12;      // bytes/frame: 12 (M6P1) or 24 (M6P2)
+static bool            g_framesRaw  = false;   // true = M6P2 float32 pre-cue frames
 static volatile bool     playbackActive = false;
 static volatile bool     playbackLoop   = true;
 static volatile uint32_t playbackIdx    = 0;
 
+// .m6p header (64 bytes): magic[4], u16 ver@4, u16 rate@6, u32 count@8,
+// u32 loop@12, name[32]@16, u16 bits@48, u32 crc32@52, u8 format@56.
+//   M6P1 = baked 6×uint16 frames (12B, post-cue). g_framesRaw=false.
+//   M6P2 = raw pre-cue frames; format byte @56: 1 => 6×float32 (24B).
 static bool parseSequence() {
     const uint8_t* h = _seq_start;
     size_t total = (size_t)(_seq_end - _seq_start);
-    if (total < 64 || memcmp(h, "M6P1", 4) != 0) return false;
+    if (total < 64) return false;
+
+    bool isM6P1 = (memcmp(h, "M6P1", 4) == 0);
+    bool isM6P2 = (memcmp(h, "M6P2", 4) == 0);
+    if (!isM6P1 && !isM6P2) return false;
+
     memcpy(&seqRateHz,    h + 6,  2);
     memcpy(&seqCount,     h + 8,  4);
     memcpy(&seqLoopPoint, h + 12, 4);
     memcpy(&seqBits,      h + 48, 2);
+
+    if (isM6P2) {
+        uint8_t fmt = h[56];
+        if (fmt != 1) return false;      // only float32 raw is defined today
+        g_framesRaw = true;
+        seqStride   = 24;                 // 6 × float32
+    } else {
+        g_framesRaw = false;
+        seqStride   = 12;                 // 6 × uint16 (baked)
+    }
+
     if (seqRateHz == 0 || seqCount == 0) return false;
-    if ((size_t)64 + (size_t)seqCount * 12 > total) return false;   // truncated
+    if ((size_t)64 + (size_t)seqCount * seqStride > total) return false;   // truncated
     if (seqLoopPoint >= seqCount) seqLoopPoint = 0;
     seqSamples = h + 64;
     return true;
 }
 
-// Live serial/BLE input takes precedence — cancel playback on any live packet.
-static inline void playbackCancelOnLiveInput() {
-    if (playbackActive) {
-        playbackActive = false;
-        serial_printf("PLAY:STOP -- live input took over\r\n");
+// Decode one embedded frame (M6P1 uint16 or M6P2 float32) into raw[6].
+static inline void decodeSeqFrame(const uint8_t* p, float raw[6]) {
+    if (g_framesRaw) {
+        memcpy(raw, p, 6 * sizeof(float));
+    } else {
+        for (int i = 0; i < 6; i++) {
+            uint16_t v = (uint16_t)p[i * 2] | ((uint16_t)p[i * 2 + 1] << 8);
+            raw[i] = (float)v;
+        }
     }
 }
 
+// PlaybackTask is now a PRODUCER: it paces to the file rate and pushes each
+// sample into the shared target (raw M6P2 -> TGT_RAW so CueTask cues it;
+// baked M6P1 -> TGT_BAKED). CueTask does the IK/servo at cueLoopHz.
 static void PlaybackTask(void* pv) {
     (void)pv;
-    const TickType_t period = pdMS_TO_TICKS(1000 / (seqRateHz ? seqRateHz : 50));
+    uint16_t rate = (seqRateHz ? seqRateHz : 50);
+    TickType_t period = pdMS_TO_TICKS(1000 / rate);
+    if (period < 1) period = 1;
     TickType_t last = xTaskGetTickCount();
     for (;;) {
         if (playbackActive && seqSamples && seqCount) {
-            // Decode → IK → servo (also refreshes the activity watchdog).
-            process_binary_packet(seqSamples + (size_t)playbackIdx * 12);
+            float raw[6];
+            decodeSeqFrame(seqSamples + (size_t)playbackIdx * seqStride, raw);
+            writeTarget(raw, g_framesRaw ? TGT_RAW : TGT_BAKED);
             uint32_t nxt = playbackIdx + 1;
             if (nxt >= seqCount) {
                 if (playbackLoop) {
@@ -444,6 +602,101 @@ static void PlaybackTask(void* pv) {
         }
         vTaskDelayUntil(&last, period);
     }
+}
+
+// ── CueTask — fixed-rate consumer (SOLE servo writer) ────────────────
+// MCU_HIFI_CUEING.md "DECISIONS APPLIED" hold-only variant: reads the freshest
+// sample (zero-order hold), runs the cue chain for RAW frames, maps to
+// position, per-time slews, IK, writes servos — all at cueLoopHz (== servoRateHz).
+static void CueTask(void* pv) {
+    (void)pv;
+    // Retune biquads to the loop rate up front (FIX TRAP A).
+    applyServoRate(servoRateHz);
+    uint16_t curRate = servoRateHz;
+    TickType_t period = pdMS_TO_TICKS(1000 / curRate);
+    if (period < 1) period = 1;
+    TickType_t last = xTaskGetTickCount();
+
+    for (;;) {
+        // Pick up a runtime servo-rate change (SERVO:RATE / SERVO:MODE).
+        if (servoRateHz != curRate) {
+            curRate = servoRateHz;
+            period  = pdMS_TO_TICKS(1000 / curRate);
+            if (period < 1) period = 1;
+        }
+        const float dt = 1.0f / (float)curRate;
+
+        float ch[6]; int64_t ts; int fmt;
+        readTarget(ch, &ts, &fmt);
+        int64_t age = esp_timer_get_time() - ts;
+
+        float pos[6];
+        if (g_source == SRC_OFF) {
+            // Gated: home and ignore incoming motion (one-tap kill).
+            for (int i = 0; i < 6; i++) pos[i] = 0.0f;
+        } else if (age > (int64_t)CUE_LOST_DECAY_MS * 1000) {
+            // Lost: decay toward home so we never park at a stale tilt.
+            for (int i = 0; i < 6; i++) pos[i] = 0.0f;
+        } else if (fmt == TGT_RAW) {
+            float f[6], m[6], o[6];
+            processInputFilter(&inputFilter, ch, f);
+            processMotionCueing(&mcaConfig, f, m);
+            mcaApplyOutputStage(&mcaConfig, m, o);
+            mapRawToPosition(o, &axisScales, maxRawInput, pos);
+        } else if (fmt == TGT_PHYS) {
+            for (int i = 0; i < 6; i++) pos[i] = ch[i];
+        } else { // TGT_BAKED
+            mapRawToPosition(ch, &axisScales, maxRawInput, pos);
+        }
+
+        for (int i = 0; i < 6; i++) arr[i] = pos[i];   // telemetry snapshot
+        driveServos(pos, dt);
+        vTaskDelayUntil(&last, period);
+    }
+}
+
+// ── Source transitions ───────────────────────────────────────────────
+// Reset filter state on EVERY transition (DECISIONS r4 / task requirement) so
+// stale washout doesn't bleed across a mode change.
+static void setSource(Source s) {
+    resetMotionCueing(&mcaConfig);
+    resetInputFilter(&inputFilter);
+
+    switch (s) {
+        case SRC_OFF: {
+            playbackActive = false;
+            inputMode = INPUT_SERIAL;
+            float home[6] = {0, 0, 0, 0, 0, 0};
+            writeTarget(home, TGT_PHYS);      // CueTask homes + gates
+            break;
+        }
+        case SRC_DEMO: {
+            if (seqSamples && seqCount) {
+                inputBitRange = (uint8_t)seqBits;
+                maxRawInput   = (float)((1 << seqBits) - 1);
+                playbackIdx    = 0;
+                playbackActive = true;
+                inputMode      = INPUT_PLAYBACK;
+            }
+            break;
+        }
+        case SRC_LIVE: {
+            playbackActive = false;
+            inputMode = INPUT_SERIAL;         // await CH_DATA / CH_DATA_RAW
+            break;
+        }
+    }
+    g_source = s;
+}
+
+// Gate for incoming live motion (CH_DATA / CH_DATA_RAW / CSV). Returns false
+// when SOURCE:OFF (motion killed -> ignore). Otherwise auto-switches DEMO->LIVE
+// on first live packet (preserves the old "live input takes over playback"
+// behavior; resets filters exactly once on the transition).
+static inline bool liveMotionGate() {
+    if (g_source == SRC_OFF) return false;
+    if (g_source != SRC_LIVE) setSource(SRC_LIVE);
+    return true;
 }
 
 // ── Legacy CSV Parser + Command Handler ──────────────────────────────
@@ -602,10 +855,20 @@ void process_data(char* data) {
     if (strcmp(data, "MCA?") == 0) {
         serial_printf("MCA:preset=%s,enabled=%d,sr=%.0f\r\n",
             mcaPresetName(mcaConfig.preset), mcaConfig.enabled, mcaConfig.sample_rate);
+        serial_printf("MCA:intensity=%.3f,gain=%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\r\n",
+            mcaGetIntensity(&mcaConfig),
+            mcaConfig.axis_gain[0], mcaConfig.axis_gain[1], mcaConfig.axis_gain[2],
+            mcaConfig.axis_gain[3], mcaConfig.axis_gain[4], mcaConfig.axis_gain[5]);
+        serial_printf("MCA:invert=%d,%d,%d,%d,%d,%d\r\n",
+            mcaConfig.axis_invert[0], mcaConfig.axis_invert[1], mcaConfig.axis_invert[2],
+            mcaConfig.axis_invert[3], mcaConfig.axis_invert[4], mcaConfig.axis_invert[5]);
         return;
     }
 
-    // ── MCA:preset_name — Set motion cueing preset ──────────────────
+    // ── MCA:preset_name / granular cue-param setters ────────────────
+    // Granular setters map to the shared stewart-core API + the new output
+    // stage (intensity / per-axis gain / invert). Persist with MCA:SAVE
+    // (mcaSaveToNVS writes the whole shared struct blob).
     if (strncmp(data, "MCA:", 4) == 0) {
         const char* name = data + 4;
         if (strcmp(name, "SAVE") == 0) {
@@ -615,7 +878,66 @@ void process_data(char* data) {
         }
         if (strcmp(name, "RESET") == 0) {
             resetMotionCueing(&mcaConfig);
+            resetInputFilter(&inputFilter);
             serial_printf("MCA:RESET\r\n");
+            return;
+        }
+        // ── Output stage (v6) ──
+        if (strncmp(name, "INTENSITY=", 10) == 0) {
+            float v = atof(name + 10);
+            mcaSetIntensity(&mcaConfig, v);
+            serial_printf("MCA:INTENSITY=%.3f\r\n", mcaGetIntensity(&mcaConfig));
+            return;
+        }
+        if (strncmp(name, "GAIN=", 5) == 0) {          // output-stage per-axis gain
+            int ax; float v;
+            if (sscanf(name + 5, "%d,%f", &ax, &v) == 2) {
+                mcaSetAxisGain(&mcaConfig, ax, v);
+                serial_printf("MCA:GAIN[%d]=%.3f\r\n", ax, mcaGetAxisGain(&mcaConfig, ax));
+            } else serial_printf("MCA:ERR GAIN=<axis>,<val>\r\n");
+            return;
+        }
+        if (strncmp(name, "INVERT=", 7) == 0) {
+            int ax, v;
+            if (sscanf(name + 7, "%d,%d", &ax, &v) == 2) {
+                mcaSetAxisInvert(&mcaConfig, ax, v);
+                serial_printf("MCA:INVERT[%d]=%d\r\n", ax, mcaGetAxisInvert(&mcaConfig, ax));
+            } else serial_printf("MCA:ERR INVERT=<axis>,<0|1>\r\n");
+            return;
+        }
+        // ── Washout channel setters ──
+        if (strncmp(name, "CHGAIN=", 7) == 0) {
+            int ax; float v;
+            if (sscanf(name + 7, "%d,%f", &ax, &v) == 2) {
+                mcaSetChannelGain(&mcaConfig, ax, v);
+                serial_printf("MCA:CHGAIN[%d]=%.3f\r\n", ax, v);
+            } else serial_printf("MCA:ERR CHGAIN=<axis>,<val>\r\n");
+            return;
+        }
+        if (strncmp(name, "HPFC=", 5) == 0) {
+            int ax; float v;
+            if (sscanf(name + 5, "%d,%f", &ax, &v) == 2) {
+                mcaSetChannelHpFc(&mcaConfig, ax, v);
+                serial_printf("MCA:HPFC[%d]=%.3f\r\n", ax, v);
+            } else serial_printf("MCA:ERR HPFC=<axis>,<fc>\r\n");
+            return;
+        }
+        if (strncmp(name, "LPFC=", 5) == 0) {
+            int ax; float v;
+            if (sscanf(name + 5, "%d,%f", &ax, &v) == 2) {
+                mcaSetChannelLpFc(&mcaConfig, ax, v);
+                serial_printf("MCA:LPFC[%d]=%.3f\r\n", ax, v);
+            } else serial_printf("MCA:ERR LPFC=<axis>,<fc>\r\n");
+            return;
+        }
+        // ── Tilt coordination gains (surge->pitch, sway->roll) ──
+        if (strncmp(name, "TILT=", 5) == 0) {
+            float sg, wg;
+            if (sscanf(name + 5, "%f,%f", &sg, &wg) == 2) {
+                mcaSetTiltSurgeGain(&mcaConfig, sg);
+                mcaSetTiltSwayGain(&mcaConfig, wg);
+                serial_printf("MCA:TILT surge=%.3f sway=%.3f\r\n", sg, wg);
+            } else serial_printf("MCA:ERR TILT=<surge>,<sway>\r\n");
             return;
         }
         int found = -1;
@@ -679,26 +1001,82 @@ void process_data(char* data) {
     // ── ESTOP:SOFT — Return all servos to center ─────────────────────
     if (strcmp(data, "ESTOP:SOFT") == 0) {
         playbackActive = false;   // E-stop overrides playback
-        if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            float home[6] = {0, 0, 0, 0, 0, 0};
-            for (int i = 0; i < 6; i++) arr[i] = 0;
-            applyMotionValues(home);
-            xSemaphoreGive(xMutex);
-        }
+        float home[6] = {0, 0, 0, 0, 0, 0};
+        writeTarget(home, TGT_PHYS);   // CueTask homes on next tick
         serial_printf("ESTOP:SOFT -- Servos homing to center\r\n");
         return;
     }
 
     // ── ZERO — Reset to home position ────────────────────────────────
     if (strcmp(data, "ZERO") == 0) {
-        if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            float home[6] = {0, 0, 0, 0, 0, 0};
-            for (int i = 0; i < 6; i++) arr[i] = 0;
-            applyMotionValues(home);
-            xSemaphoreGive(xMutex);
-            serial_printf("ZERO:OK -- All servos at center\r\n");
+        float home[6] = {0, 0, 0, 0, 0, 0};
+        writeTarget(home, TGT_PHYS);
+        serial_printf("ZERO:OK -- All servos homing to center\r\n");
+        return;
+    }
+
+    // ── SOURCE:* — Motion source selector (OFF / DEMO / LIVE) ─────────
+    // SOURCE:OFF|DEMO|LIVE  |  SOURCE:BOOT=OFF|DEMO|LIVE  |  SOURCE?
+    if (strcmp(data, "SOURCE?") == 0) {
+        serial_printf("SOURCE:%s boot=%s\r\n", sourceName(g_source), sourceName(loadBootSource()));
+        return;
+    }
+    if (strncmp(data, "SOURCE:", 7) == 0) {
+        const char* arg = data + 7;
+        Source parsed; bool ok = true;
+        if      (strcmp(arg, "OFF")  == 0) parsed = SRC_OFF;
+        else if (strcmp(arg, "DEMO") == 0) parsed = SRC_DEMO;
+        else if (strcmp(arg, "LIVE") == 0) parsed = SRC_LIVE;
+        else ok = false;
+        if (ok) {
+            setSource(parsed);
+            serial_printf("SOURCE:%s\r\n", sourceName(g_source));
+            return;
+        }
+        if (strncmp(arg, "BOOT=", 5) == 0) {
+            const char* b = arg + 5;
+            Source bs; bool bok = true;
+            if      (strcmp(b, "OFF")  == 0) bs = SRC_OFF;
+            else if (strcmp(b, "DEMO") == 0) bs = SRC_DEMO;
+            else if (strcmp(b, "LIVE") == 0) bs = SRC_LIVE;
+            else bok = false;
+            if (bok) { saveBootSource(bs); serial_printf("SOURCE:BOOT=%s\r\n", sourceName(bs)); }
+            else serial_printf("SOURCE:ERR boot expects OFF|DEMO|LIVE\r\n");
+            return;
+        }
+        serial_printf("SOURCE:ERR unknown '%s' (OFF|DEMO|LIVE|BOOT=...)\r\n", arg);
+        return;
+    }
+
+    // ── SERVO:RATE / SERVO:MODE — servo-rate profile (analog/digital) ─
+    // SERVO:RATE=50|250 (Hz)  |  SERVO:MODE=ANALOG|DIGITAL  |  SERVO:RATE?
+    // Sets BOTH the LEDC carrier and the CueTask loop rate; persists in NVS.
+    if (strcmp(data, "SERVO:RATE?") == 0) {
+        serial_printf("SERVO:RATE=%u (%s)\r\n", (unsigned)servoRateHz,
+                      servoRateHz >= 200 ? "digital" : "analog");
+        return;
+    }
+    if (strncmp(data, "SERVO:RATE=", 11) == 0) {
+        int hz = atoi(data + 11);
+        if (hz >= SERVO_RATE_MIN_HZ && hz <= SERVO_RATE_MAX_HZ) {
+            applyServoRate((uint16_t)hz);
+            saveConfigToNVS();
+            serial_printf("SERVO:RATE=%u (cueLoopHz + carrier)\r\n", (unsigned)servoRateHz);
         } else {
-            serial_printf("ZERO:ERR -- Mutex timeout\r\n");
+            serial_printf("ERR:SERVO:RATE range %d-%d\r\n", SERVO_RATE_MIN_HZ, SERVO_RATE_MAX_HZ);
+        }
+        return;
+    }
+    if (strncmp(data, "SERVO:MODE=", 11) == 0) {
+        const char* m = data + 11;
+        if (strcmp(m, "ANALOG") == 0) {
+            applyServoRate(SERVO_RATE_ANALOG_HZ); saveConfigToNVS();
+            serial_printf("SERVO:MODE=ANALOG (%dHz)\r\n", SERVO_RATE_ANALOG_HZ);
+        } else if (strcmp(m, "DIGITAL") == 0) {
+            applyServoRate(SERVO_RATE_DIGITAL_HZ); saveConfigToNVS();
+            serial_printf("SERVO:MODE=DIGITAL (%dHz)\r\n", SERVO_RATE_DIGITAL_HZ);
+        } else {
+            serial_printf("ERR:SERVO:MODE expects ANALOG|DIGITAL\r\n");
         }
         return;
     }
@@ -707,38 +1085,27 @@ void process_data(char* data) {
     // PLAY:START | PLAY:STOP | PLAY:LOOP=0/1 | PLAY:STATUS | PLAY:BOOT=0/1
     if (strncmp(data, "PLAY:", 5) == 0) {
         const char* arg = data + 5;
-        if (strcmp(arg, "START") == 0) {
+        if (strcmp(arg, "START") == 0) {          // alias for SOURCE:DEMO
             if (!seqSamples) { serial_printf("PLAY:ERR no sequence\r\n"); return; }
-            // Decode the sequence with the bit depth it was baked for.
-            inputBitRange = (uint8_t)seqBits;
-            maxRawInput   = (float)((1 << seqBits) - 1);
-            playbackIdx = 0;
-            playbackActive = true;
-            inputMode = INPUT_PLAYBACK;
-            lastPacketTimeUs = esp_timer_get_time();
-            serial_printf("PLAY:START %u samples @ %uHz (%d-bit)\r\n",
-                          (unsigned)seqCount, (unsigned)seqRateHz, seqBits);
-        } else if (strcmp(arg, "STOP") == 0) {
-            playbackActive = false;
-            if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                float home[6] = {0, 0, 0, 0, 0, 0};
-                for (int i = 0; i < 6; i++) arr[i] = 0;
-                applyMotionValues(home);
-                xSemaphoreGive(xMutex);
-            }
-            inputMode = INPUT_SERIAL;
+            setSource(SRC_DEMO);
+            serial_printf("PLAY:START %u samples @ %uHz (%d-bit, %s)\r\n",
+                          (unsigned)seqCount, (unsigned)seqRateHz, seqBits,
+                          g_framesRaw ? "raw" : "baked");
+        } else if (strcmp(arg, "STOP") == 0) {    // alias for SOURCE:OFF
+            setSource(SRC_OFF);
             serial_printf("PLAY:STOP\r\n");
         } else if (strncmp(arg, "LOOP=", 5) == 0) {
             playbackLoop = atoi(arg + 5) != 0;
             serial_printf("PLAY:LOOP=%d\r\n", playbackLoop ? 1 : 0);
         } else if (strcmp(arg, "STATUS") == 0) {
-            serial_printf("PLAY:STATUS active=%d idx=%u/%u rate=%u loop=%d boot=%d\r\n",
+            serial_printf("PLAY:STATUS active=%d idx=%u/%u rate=%u loop=%d src=%s boot=%s\r\n",
                 playbackActive ? 1 : 0, (unsigned)playbackIdx, (unsigned)seqCount,
-                (unsigned)seqRateHz, playbackLoop ? 1 : 0, loadPlayOnBoot() ? 1 : 0);
-        } else if (strncmp(arg, "BOOT=", 5) == 0) {
+                (unsigned)seqRateHz, playbackLoop ? 1 : 0,
+                sourceName(g_source), sourceName(loadBootSource()));
+        } else if (strncmp(arg, "BOOT=", 5) == 0) {   // alias: 0=OFF, 1=DEMO
             bool on = atoi(arg + 5) != 0;
-            savePlayOnBoot(on);
-            serial_printf("PLAY:BOOT=%d\r\n", on ? 1 : 0);
+            saveBootSource(on ? SRC_DEMO : SRC_OFF);
+            serial_printf("PLAY:BOOT=%d (source=%s)\r\n", on ? 1 : 0, on ? "DEMO" : "OFF");
         } else {
             serial_printf("PLAY:ERR unknown '%s'\r\n", arg);
         }
@@ -756,17 +1123,8 @@ void process_data(char* data) {
     }
 
     if (count == 6) {
-        playbackCancelOnLiveInput();
-        float position[6];
-        mapRawToPosition(raw, &axisScales, maxRawInput, position);
-
-        if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-            for (int i = 0; i < 6; i++) arr[i] = position[i];
-            applyMotionValues(position);
-            lastPacketTimeUs = esp_timer_get_time();
-            watchdogTripped = false;
-            xSemaphoreGive(xMutex);
-        }
+        if (liveMotionGate())
+            writeTarget(raw, TGT_BAKED);   // legacy CSV = raw counts, baked path
     }
 }
 
@@ -801,8 +1159,13 @@ extern "C" void app_main(void) {
     cobs_transport_init(921600);
     cobs_set_data_handler([](const uint8_t *payload, int len) {
         (void)len;
-        playbackCancelOnLiveInput();   // live host motion overrides playback
-        process_binary_packet(payload);
+        if (liveMotionGate())          // SOURCE:OFF gates; DEMO auto-switches to LIVE
+            process_binary_packet(payload);   // baked -> shared target
+    });
+    cobs_set_data_raw_handler([](const uint8_t *payload, int len) {
+        (void)len;
+        if (liveMotionGate())
+            process_raw_packet(payload);       // RAW pre-cue -> shared target (cued by CueTask)
     });
     cobs_set_cmd_handler([](const char *cmd) {
         char buf[256];
@@ -846,10 +1209,10 @@ extern "C" void app_main(void) {
     // Setup LEDC PWM for servos
     setupServoPWM();
 
-    // Home all servos to center
+    // Home all servos to center (direct — CueTask not started yet)
     {
         float home[6] = {0, 0, 0, 0, 0, 0};
-        applyMotionValues(home);
+        driveServos(home, 1.0f / (float)servoRateHz);
     }
 
     serial_printf("Servos initialized at center. Enabling power...\r\n");
@@ -875,14 +1238,20 @@ extern "C" void app_main(void) {
     serial_printf("Commands: VERSION? FINGERPRINT? CONFIG? SCALE? BITS:N ZERO ESTOP:SOFT\r\n");
     serial_printf("         MCA? MCA:preset ACCEL? ACCEL:GAIN= ACCEL:MAP=\r\n");
 
-    // Initialize Motion Cueing (for BLE accel mode)
+    // Initialize the shared on-device cue engine (MCA + input filter).
     initMotionCueing(&mcaConfig, MCA_SAMPLE_RATE);
+    initInputFilter(&inputFilter, MCA_SAMPLE_RATE);
     if (mcaLoadFromNVS(&mcaConfig) == 0) {
-        serial_printf("MCA: Loaded from NVS (preset=%s)\r\n", mcaPresetName(mcaConfig.preset));
+        serial_printf("MCA: Loaded from NVS (preset=%s, intensity=%.2f)\r\n",
+                      mcaPresetName(mcaConfig.preset), mcaGetIntensity(&mcaConfig));
     } else {
         setMotionCueingPreset(&mcaConfig, MCA_MODERATE);
         serial_printf("MCA: Default preset=%s\r\n", mcaPresetName(mcaConfig.preset));
     }
+    // Sync biquads + LEDC carrier to the servo-rate profile (FIX TRAP A).
+    applyServoRate(servoRateHz);
+    serial_printf("SERVO:RATE=%u Hz (cueLoopHz; %s)\r\n", (unsigned)servoRateHz,
+                  servoRateHz >= 200 ? "digital" : "analog");
 
     // Initialize BLE transport
 #ifdef ENABLE_BLE
@@ -895,26 +1264,29 @@ extern "C" void app_main(void) {
     }
 #endif
 
-    // ── Embedded motion-cued sequence playback ───────────────────────
-    if (parseSequence()) {
-        serial_printf("PLAY: sequence ready -- %u samples @ %uHz, %d-bit, loop@%u (~%.1fs)\r\n",
-            (unsigned)seqCount, (unsigned)seqRateHz, seqBits, (unsigned)seqLoopPoint,
-            (double)seqCount / (seqRateHz ? seqRateHz : 50));
-        // Playback runs on APP_CPU (core 1) at a fixed rate, clear of the
-        // serial monitor + main loop on core 0.
+    // ── CueTask: the fixed-rate consumer + SOLE servo writer ─────────
+    // High prio, core 1 (APP_CPU), clear of the serial monitor on core 0.
+    xTaskCreatePinnedToCore(CueTask, "Cue", 4096, NULL, 7, NULL, 1);
+
+    // ── Embedded motion-cued sequence playback (producer) ────────────
+    bool haveSeq = parseSequence();
+    if (haveSeq) {
+        serial_printf("PLAY: sequence ready -- %u samples @ %uHz, %d-bit, %s, loop@%u (~%.1fs)\r\n",
+            (unsigned)seqCount, (unsigned)seqRateHz, seqBits, g_framesRaw ? "raw" : "baked",
+            (unsigned)seqLoopPoint, (double)seqCount / (seqRateHz ? seqRateHz : 50));
         xTaskCreatePinnedToCore(PlaybackTask, "Playback", 4096, NULL, 6, NULL, 1);
-        if (loadPlayOnBoot()) {
-            inputBitRange = (uint8_t)seqBits;
-            maxRawInput   = (float)((1 << seqBits) - 1);
-            playbackIdx = 0;
-            playbackActive = true;
-            inputMode = INPUT_PLAYBACK;
-            serial_printf("PLAY: auto-start (play_on_boot=1)\r\n");
-        } else {
-            serial_printf("PLAY: idle -- send PLAY:START or set PLAY:BOOT=1\r\n");
-        }
     } else {
         serial_printf("PLAY: no valid embedded sequence\r\n");
+    }
+
+    // ── Apply the boot source (OFF / DEMO / LIVE), default = DEMO ─────
+    Source bootSrc = loadBootSource();
+    if (bootSrc == SRC_DEMO && !haveSeq) {
+        serial_printf("SOURCE: boot=DEMO but no sequence -> OFF\r\n");
+        setSource(SRC_OFF);
+    } else {
+        setSource(bootSrc);
+        serial_printf("SOURCE: boot=%s applied\r\n", sourceName(g_source));
     }
 
     // Seed watchdog timer so it doesn't trip immediately on boot
@@ -939,32 +1311,25 @@ extern "C" void app_main(void) {
             float sway_mm  = accelRaw[4] * accelGain[1];
             float heave_mm = accelRaw[5] * accelGain[2];
 
-            // Position: [surge, sway, heave, roll, pitch, yaw]
+            // Position: [surge, sway, heave, roll, pitch, yaw] — already physical.
+            // Producer: hand to CueTask as TGT_PHYS (it does slew + IK + servo).
             float position[6] = {surge_mm, sway_mm, heave_mm, roll_rad, pitch_rad, yaw_rad};
-
-            // Apply to servos
-            if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-                for (int i = 0; i < 6; i++) arr[i] = position[i];
-                applyMotionValues(position);
-                xSemaphoreGive(xMutex);
-            }
+            if (g_source != SRC_OFF)
+                writeTarget(position, TGT_PHYS);
         }
 
-        // ── Activity watchdog: home to center if no motion data for 500ms ──
+        // ── Activity watchdog (advisory) ──────────────────────────────
+        // CueTask already decays to home when the target goes stale
+        // (CUE_LOST_DECAY_MS), so the watchdog no longer drives servos — it
+        // just logs once and drops BLE-accel mode back to serial.
         int64_t now = esp_timer_get_time();
         if (lastPacketTimeUs > 0 && (now - lastPacketTimeUs) > WATCHDOG_TIMEOUT_US) {
             if (!watchdogTripped) {
-                if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-                    float home[6] = {0, 0, 0, 0, 0, 0};
-                    for (int i = 0; i < 6; i++) arr[i] = 0;
-                    applyMotionValues(home);
-                    xSemaphoreGive(xMutex);
-                }
                 watchdogTripped = true;
                 if (inputMode == INPUT_BLE_ACCEL) {
                     inputMode = INPUT_SERIAL;  // fall back to serial when accel stops
                 }
-                serial_printf("WDT:HOME -- No input for 500ms, servos homed\r\n");
+                serial_printf("WDT:HOME -- No input for 500ms (CueTask decaying to home)\r\n");
             }
         }
 

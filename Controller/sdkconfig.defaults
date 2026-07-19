@@ -3,9 +3,11 @@
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
 
-# Flash + custom partition table — the ~275KB embedded playback sequence needs a
-# factory app partition larger than the stock 1MB single-app layout.
-CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y
+# Flash + custom partition table. Physical chip is 4MB (esptool flash_id); the
+# stock 2MB build config wasted half of it. 4MB no-OTA layout (DECISIONS r3):
+# 2MB factory app + ~1.9MB raw `seq` data partition, nvs/phy/factory offsets
+# preserved so stored servo calibration + mca_cfg survive the repartition.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 

@@ -7,11 +7,13 @@
 #include <stdint.h>
 
 // Channel IDs for multiplexed COBS transport
-#define COBS_CH_DATA  0x01  // App->ESP: motion data (12 bytes: 6x uint16 LE)
-#define COBS_CH_CMD   0x02  // App->ESP: ASCII command string
-#define COBS_CH_TEL   0x03  // ESP->App: telemetry (48 bytes: 12x float32 LE)
-#define COBS_CH_LOG   0x04  // ESP->App: log/debug text
-#define COBS_CH_RESP  0x05  // ESP->App: command response text
+#define COBS_CH_DATA      0x01  // App->ESP: baked motion data (12 bytes: 6x uint16 LE)
+#define COBS_CH_CMD       0x02  // App->ESP: ASCII command string
+#define COBS_CH_TEL       0x03  // ESP->App: telemetry (48 bytes: 12x float32 LE)
+#define COBS_CH_LOG       0x04  // ESP->App: log/debug text
+#define COBS_CH_RESP      0x05  // ESP->App: command response text
+#define COBS_CH_DATA_RAW  0x07  // App->ESP: RAW pre-cue telemetry (24 bytes: 6x float32 LE)
+                                //   cued on-device by CueTask (DECISIONS round 3/4)
 
 // Max COBS overhead: 1 byte per 254 input bytes + 1
 #define COBS_MAX_ENC_SIZE(n) ((n) + ((n) / 254) + 1)
