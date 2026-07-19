@@ -1,18 +1,16 @@
 # Main component for Mini-6DOF ESP-IDF project
 
 idf_component_register(
-    SRCS 
+    SRCS
         "main.cpp"
         "helpers.cpp"
-        "InverseKinematics.cpp"
-        "AxisScaling.cpp"
-        "MotionCueing.cpp"
         "BleTransport.cpp"
         "CobsTransport.cpp"
-    INCLUDE_DIRS 
+    INCLUDE_DIRS
         "."
         "../include"
     PRIV_REQUIRES
+        stewart-core  # Shared IK / AxisScaling / MotionCueing (git submodule = single source of truth)
         driver        # For LEDC PWM, GPIO, UART
         esp_timer     # For high-resolution timing
         nvs_flash     # For non-volatile storage
@@ -23,14 +21,14 @@ idf_component_register(
         "laps123_moderate.m6p"   # baked 50Hz motion-cued laps 1-3 for autonomous playback
 )
 
-# Enable C++11 support
+# Enable C++11 support (firmware sources; stewart-core compiles under its own component)
 set_source_files_properties(
-    main.cpp helpers.cpp InverseKinematics.cpp AxisScaling.cpp MotionCueing.cpp BleTransport.cpp CobsTransport.cpp
+    main.cpp helpers.cpp BleTransport.cpp CobsTransport.cpp
     PROPERTIES COMPILE_FLAGS "-std=gnu++11"
 )
 
 # Performance optimization flags
-target_compile_options(${COMPONENT_LIB} PRIVATE 
+target_compile_options(${COMPONENT_LIB} PRIVATE
     -O2
     -ffast-math
     -fno-exceptions

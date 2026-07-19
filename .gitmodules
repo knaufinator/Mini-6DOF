@@ -1,0 +1,3 @@
+[submodule "Controller/components/stewart-core"]
+	path = Controller/components/stewart-core
+	url = https://github.com/knaufinator/stewart-core.git
