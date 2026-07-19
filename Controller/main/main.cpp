@@ -654,7 +654,16 @@ static void CueTask(void* pv) {
             processMotionCueing(&mcaConfig, f, m);
             mcaApplyOutputStage(&mcaConfig, m, o);
             float tmp = o[0]; o[0] = o[1]; o[1] = tmp;   // surge<->sway (app->device)
-            mapRawToPosition(o, &axisScales, maxRawInput, pos);
+            // RAW = signed PERCENT (pre-cue telemetry). mapRawToPosition expects the
+            // COUNT domain [0..max_raw] centered at home, so convert first per the
+            // pinned contract: counts = home*(1 + pct/100)  =>  ±100% spans 0..max_raw
+            // and the mapping yields position = scale*(pct/100). Feeding raw percent
+            // straight in (the previous code) sits ~0 counts << home and rails the
+            // output — decoupled from input. Bug found on the first live stream.
+            float home = (float)((int)maxRawInput / 2);
+            float counts[6];
+            for (int i = 0; i < 6; i++) counts[i] = home * (1.0f + o[i] * 0.01f);
+            mapRawToPosition(counts, &axisScales, maxRawInput, pos);
         } else if (fmt == TGT_PHYS) {
             for (int i = 0; i < 6; i++) pos[i] = ch[i];
         } else { // TGT_BAKED
