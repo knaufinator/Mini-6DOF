@@ -1,5 +1,14 @@
 # Mini-6DOF Stewart Platform
 
+> ## ⚠️ ARCHIVED — this firmware has moved
+> The Mini-6DOF firmware now lives in the **unified 6DOF repo** as the **`mini/` variant**, sharing the
+> `stewart-core` submodule with the full-system `Controller/` firmware:
+> **→ [6DOF-Rotary-Stewart-Motion-Simulator › `mini/`](https://github.com/knaufinator/6DOF-Rotary-Stewart-Motion-Simulator/tree/phoenix/mini)**
+> (see [`FIRMWARE.md`](https://github.com/knaufinator/6DOF-Rotary-Stewart-Motion-Simulator/blob/phoenix/FIRMWARE.md) for the variant map).
+> This repository is **read-only / no longer active** — all new work (incl. the Phase-3 on-ESP cue engine,
+> SOURCE modes, M6P2, and `SERVO:RATE`) happens in the unified repo. Kept for history.
+
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform: ESP32](https://img.shields.io/badge/Platform-ESP32-blue.svg)](https://www.espressif.com/en/products/socs/esp32)
 [![Firmware: ESP-IDF v5.2](https://img.shields.io/badge/Firmware-ESP--IDF%20v5.2-red.svg)](https://docs.espressif.com/projects/esp-idf/en/v5.2/)
