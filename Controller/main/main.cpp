@@ -527,10 +527,15 @@ static volatile bool     playbackActive = false;
 static volatile bool     playbackLoop   = true;
 static volatile uint32_t playbackIdx    = 0;
 
-// .m6p header (64 bytes): magic[4], u16 ver@4, u16 rate@6, u32 count@8,
-// u32 loop@12, name[32]@16, u16 bits@48, u32 crc32@52, u8 format@56.
-//   M6P1 = baked 6×uint16 frames (12B, post-cue). g_framesRaw=false.
-//   M6P2 = raw pre-cue frames; format byte @56: 1 => 6×float32 (24B).
+// .m6p header (64 bytes), branch on magic (app Phase-2 contract, PR #29):
+//   common: magic[4]@0, u16 ver@4, u16 rate@6, u32 count@8, u32 loop@12,
+//           name[32]@16..47, u32 crc32@52.
+//   M6P1 (baked): u16 bits@48; frames = 6×uint16 LE (12B, post-cue, wire order
+//                 = device order, surge/sway already swapped). g_framesRaw=false.
+//   M6P2 (raw):   u8 format@48 (1=float32), u8 channels@49 (=6), [50..51] rsvd,
+//                 [56..63] rsvd; frames = 6×float32 LE (24B), PRE-cueing, app
+//                 axis order (surge=0, sway=1), NO surge/sway swap on the wire
+//                 (CueTask swaps after cueing). g_framesRaw=true.
 static bool parseSequence() {
     const uint8_t* h = _seq_start;
     size_t total = (size_t)(_seq_end - _seq_start);
@@ -543,14 +548,16 @@ static bool parseSequence() {
     memcpy(&seqRateHz,    h + 6,  2);
     memcpy(&seqCount,     h + 8,  4);
     memcpy(&seqLoopPoint, h + 12, 4);
-    memcpy(&seqBits,      h + 48, 2);
 
     if (isM6P2) {
-        uint8_t fmt = h[56];
-        if (fmt != 1) return false;      // only float32 raw is defined today
+        uint8_t format   = h[48];         // 1 = float32
+        uint8_t channels = h[49];         // must be 6
+        if (format != 1 || channels != 6) return false;
         g_framesRaw = true;
         seqStride   = 24;                 // 6 × float32
+        seqBits     = 16;                 // raw float32 has no bit depth (placeholder)
     } else {
+        memcpy(&seqBits, h + 48, 2);      // M6P1: u16 bit depth @48
         g_framesRaw = false;
         seqStride   = 12;                 // 6 × uint16 (baked)
     }
@@ -638,10 +645,15 @@ static void CueTask(void* pv) {
             // Lost: decay toward home so we never park at a stale tilt.
             for (int i = 0; i < 6; i++) pos[i] = 0.0f;
         } else if (fmt == TGT_RAW) {
+            // RAW = pre-cue telemetry in APP axis order (surge=0, sway=1), no
+            // wire swap. Run the cue chain in app order (the washout/tilt engine
+            // is defined in app order), THEN swap surge<->sway into device order
+            // before scaling/IK — the swap the baked wire already carried.
             float f[6], m[6], o[6];
             processInputFilter(&inputFilter, ch, f);
             processMotionCueing(&mcaConfig, f, m);
             mcaApplyOutputStage(&mcaConfig, m, o);
+            float tmp = o[0]; o[0] = o[1]; o[1] = tmp;   // surge<->sway (app->device)
             mapRawToPosition(o, &axisScales, maxRawInput, pos);
         } else if (fmt == TGT_PHYS) {
             for (int i = 0; i < 6; i++) pos[i] = ch[i];
@@ -672,8 +684,10 @@ static void setSource(Source s) {
         }
         case SRC_DEMO: {
             if (seqSamples && seqCount) {
-                inputBitRange = (uint8_t)seqBits;
-                maxRawInput   = (float)((1 << seqBits) - 1);
+                if (!g_framesRaw) {                 // baked M6P1 uses its bit depth
+                    inputBitRange = (uint8_t)seqBits;
+                    maxRawInput   = (float)((1 << seqBits) - 1);
+                }
                 playbackIdx    = 0;
                 playbackActive = true;
                 inputMode      = INPUT_PLAYBACK;
@@ -721,7 +735,9 @@ void process_data(char* data) {
     if (strcmp(data, "FINGERPRINT?") == 0) {
         uint8_t mac[6];
         esp_efuse_mac_get_default(mac);
-        serial_printf("FINGERPRINT:%02X%02X%02X%02X%02X%02X,fw=%s,proto=%d,platform=%s\r\n",
+        // caps=raw advertises on-device RAW-HIL cueing (CH_DATA_RAW + M6P2) so
+        // the app enables raw mode (it gates on caps=...raw... in FINGERPRINT).
+        serial_printf("FINGERPRINT:%02X%02X%02X%02X%02X%02X,fw=%s,proto=%d,platform=%s,caps=raw\r\n",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
             FW_VERSION_STRING, FW_PROTOCOL_VERSION, FW_PLATFORM_ID);
         return;
