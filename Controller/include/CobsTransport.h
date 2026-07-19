@@ -41,6 +41,10 @@ typedef void (*cobs_cmd_cb_t)(const char *cmd);
 void cobs_set_data_handler(cobs_data_cb_t handler);
 void cobs_set_cmd_handler(cobs_cmd_cb_t handler);
 
+// Register handler for the RAW motion channel (COBS_CH_DATA_RAW, 24-byte
+// 6x float32 pre-cue telemetry). Dispatched separately from baked CH_DATA.
+void cobs_set_data_raw_handler(cobs_data_cb_t handler);
+
 #ifdef __cplusplus
 }
 #endif

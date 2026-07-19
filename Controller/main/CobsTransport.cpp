@@ -21,8 +21,9 @@
 #define COBS_MAX_FRAME  512
 
 static SemaphoreHandle_t s_tx_mutex = NULL;
-static cobs_data_cb_t s_data_handler = NULL;
-static cobs_cmd_cb_t  s_cmd_handler  = NULL;
+static cobs_data_cb_t s_data_handler     = NULL;
+static cobs_data_cb_t s_data_raw_handler = NULL;
+static cobs_cmd_cb_t  s_cmd_handler      = NULL;
 static int s_stdin_fd = -1;
 
 // Decoder accumulation buffer
@@ -139,6 +140,10 @@ static void dispatch_frame(const uint8_t *data, int len) {
             if (s_data_handler && plen >= 12)
                 s_data_handler(payload, plen);
             break;
+        case COBS_CH_DATA_RAW:
+            if (s_data_raw_handler && plen >= 24)
+                s_data_raw_handler(payload, plen);
+            break;
         case COBS_CH_CMD:
             if (s_cmd_handler && plen > 0) {
                 char cmd[256];
@@ -178,5 +183,6 @@ int cobs_read_process(int timeout_ms) {
     return len;
 }
 
-void cobs_set_data_handler(cobs_data_cb_t handler) { s_data_handler = handler; }
-void cobs_set_cmd_handler(cobs_cmd_cb_t handler)   { s_cmd_handler  = handler; }
+void cobs_set_data_handler(cobs_data_cb_t handler)     { s_data_handler     = handler; }
+void cobs_set_data_raw_handler(cobs_data_cb_t handler) { s_data_raw_handler = handler; }
+void cobs_set_cmd_handler(cobs_cmd_cb_t handler)       { s_cmd_handler      = handler; }
